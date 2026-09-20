@@ -21,7 +21,7 @@ set -euo pipefail
 
 # ---------- 配置 ----------
 RAW_BASE="${DSH_RAW_BASE:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main}"
-SELF_NAME="install_dsh_manager.sh"
+SELF_NAME="install.sh"
 PAYLOAD_NAME="dsh.sh"
 SELF_URL="$RAW_BASE/$SELF_NAME"
 PAYLOAD_URL="$RAW_BASE/$PAYLOAD_NAME"

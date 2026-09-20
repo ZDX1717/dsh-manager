@@ -249,7 +249,7 @@ update_self() {
     if [ ! -f "$SELF" ]; then
         err "无法定位脚本文件（当前以 $0 运行）"
         echo "请先安装后再使用本功能："
-        echo "  bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh)"
+        echo "  bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install.sh)"
         return 1
     fi
     

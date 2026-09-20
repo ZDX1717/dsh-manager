@@ -5,7 +5,7 @@ DSH-Web 服务管理脚本。
 ## 安装
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install.sh)
 ```
 
 不需要加 `sudo`，安装器会自动提权。
@@ -14,10 +14,10 @@ bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/inst
 
 ```bash
 # 管道
-curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh | bash
+curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install.sh | bash
 
 # 先下载再执行
-curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh -o /tmp/i.sh && bash /tmp/i.sh
+curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install.sh -o /tmp/i.sh && bash /tmp/i.sh
 ```
 
 安装器选项：
