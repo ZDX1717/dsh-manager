@@ -75,7 +75,7 @@ DSH_EXTRA_MIRRORS=https://your-mirror/prefix bash <(curl -sSL .../install.sh)
 9. 卸载 systemd 服务
 10. 添加快捷命令到 .bashrc
 11. 移除快捷命令从 .bashrc
-12. 更新 DSH 程序本体(npm)
+12. 安装/更新 DSH 程序本体(npm)
 
 === 备份与恢复 ===
 13. 备份与恢复管理

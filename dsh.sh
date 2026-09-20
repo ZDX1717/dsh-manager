@@ -121,11 +121,17 @@ get_dsh_version() {
 # ========== 安装引导 ==========
 install_guide() {
     title "DSH 未安装"
-    echo "请先安装 DSH："
-    echo "1. npm install -g dsh"
-    echo "2. 或下载二进制文件到: $DSH_BIN"
+    echo "DSH 程序本体尚未安装。安装方式："
     echo
-    echo "安装后重新运行此脚本"
+    echo "  方式一（推荐）：在本管理面板里直接安装"
+    echo "    菜单 12「安装/更新 DSH 程序本体(npm)」"
+    echo
+    echo "  方式二：手动执行"
+    echo "    npm install -g @deepseek-ai/dsh"
+    echo
+    echo "  方式三：下载二进制文件到 $DSH_BIN"
+    echo
+    echo "安装后回到菜单 7「初次初始化 Systemd 服务」，再启动服务。"
 }
 
 # ========== 预检查 ==========
@@ -138,90 +144,139 @@ pre_check() {
 }
 
 # ========== 更新DSH函数（npm全局更新本体） ==========
-update_dsh() {
-    title "更新 DSH 程序本体"
+# ========== 安装 / 更新 DSH 程序本体（npm） ==========
+# npm install -g 同时覆盖"全新安装"和"升级到最新"两种情况，
+# 因此安装与更新合并为同一个入口，无需两个菜单项。
+install_or_update_dsh() {
+    title "安装 / 更新 DSH 程序本体"
     
-    # 检查是否有 dsh 可执行文件
-    local DSH_FOUND=false
-    if [ -x "$DSH_BIN" ]; then
-        DSH_FOUND=true
-    elif command -v dsh >/dev/null 2>&1; then
-        DSH_FOUND=true
-    fi
-    
-    if [ "$DSH_FOUND" = false ]; then
-        err "未找到dsh可执行文件"
-        install_guide
+    # ---------- 前置依赖：npm 与 node ----------
+    if ! command -v npm >/dev/null 2>&1; then
+        err "未找到 npm（DSH 通过 npm 全局安装）"
+        echo "请先安装 Node.js 与 npm，例如："
+        echo "  Debian/Ubuntu：apt install -y nodejs npm"
+        echo "  Fedora/RHEL  ：dnf install -y nodejs npm"
+        echo "  Arch         ：pacman -S nodejs npm"
+        echo
+        echo "若发行版自带版本过旧，建议用 NodeSource 源安装较新版 Node.js。"
         return 1
     fi
+    if ! command -v node >/dev/null 2>&1; then
+        err "检测到 npm 但未找到 node，Node.js 环境不完整"
+        echo "请重新安装 Node.js 后重试。"
+        return 1
+    fi
+    echo "Node.js：$(node --version 2>/dev/null)   npm：$(npm --version 2>/dev/null)"
     
-    # 显示当前版本
-    local current_version=$(get_dsh_version)
-    echo "当前版本：$current_version"
+    # ---------- 当前安装状态 ----------
+    local installed=0
+    local current_version=""
+    if check_dsh_installed; then
+        installed=1
+        current_version=$(get_dsh_version)
+        echo "当前已安装：$current_version"
+    else
+        echo "当前状态：未安装 DSH，将执行全新安装"
+    fi
     
-    # 检查最新版本
-    echo "正在检查最新版本..."
-    local latest_version=$(npm view @deepseek-ai/dsh version 2>/dev/null)
+    # ---------- 查询最新版本 ----------
+    echo "正在查询 npm 上的最新版本..."
+    local latest_version=""
+    latest_version=$(npm view @deepseek-ai/dsh version 2>/dev/null)
     if [ -n "$latest_version" ]; then
         echo "最新版本：$latest_version"
-        
-        if [ "$current_version" = "$latest_version" ]; then
-            echo
-            warn "当前已是最新版本"
-            read -r -p "是否仍要重新安装？(y/N): " CONFIRM
-            if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-                warn "操作已取消"
-                return 0
-            fi
-        fi
     else
-        warn "无法获取最新版本信息"
+        warn "无法获取版本信息（可能是网络或 npm 源问题），仍可继续安装"
     fi
     
-    echo
-    echo "正在更新 DSH..."
-    echo
-    if [ "$(id -u)" -eq 0 ]; then
-        # 先尝试使用 npm update
-        npm update -g @deepseek-ai/dsh 2>&1
-        local ret=$?
-        
-        # 如果 update 失败，尝试使用 npm install
-        if [ $ret -ne 0 ]; then
-            echo "npm update 失败，尝试使用 npm install..."
-            npm install -g @deepseek-ai/dsh 2>&1
-            ret=$?
-        fi
-    else
-        # 先尝试使用 npm update
-        sudo npm update -g @deepseek-ai/dsh 2>&1
-        local ret=$?
-        
-        # 如果 update 失败，尝试使用 npm install
-        if [ $ret -ne 0 ]; then
-            echo "npm update 失败，尝试使用 npm install..."
-            sudo npm install -g @deepseek-ai/dsh 2>&1
-            ret=$?
+    # ---------- 已是最新时询问是否重装 ----------
+    if [ $installed -eq 1 ] && [ -n "$latest_version" ] && [ "$current_version" = "$latest_version" ]; then
+        echo
+        warn "当前已是最新版本"
+        local CONFIRM
+        read -r -p "是否仍要重新安装？(y/N): " CONFIRM || CONFIRM=""
+        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+            warn "操作已取消"
+            return 0
         fi
     fi
-
+    
+    # ---------- 执行 ----------
+    echo
+    if [ $installed -eq 1 ]; then
+        echo "正在更新 DSH 程序本体..."
+    else
+        echo "正在安装 DSH 程序本体..."
+    fi
+    echo
+    
+    local ret=0
+    # 是否需要 sudo：不看是否为 root，而是看 npm 全局前缀是否可写。
+    # 用 nvm/volta 装的 Node，全局前缀在用户家目录下，本来就不该 sudo
+    # （sudo 后 PATH 里没有那个 npm，且会装到错误位置）。
+    local npm_prefix=""
+    local npm_need_sudo=0
+    npm_prefix=$(npm prefix -g 2>/dev/null)
+    if [ "$(id -u)" -ne 0 ]; then
+        if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
+            npm_need_sudo=0
+        else
+            npm_need_sudo=1
+        fi
+    fi
+    
+    if [ "$npm_need_sudo" -eq 1 ]; then
+        echo "（npm 全局前缀 ${npm_prefix:-未知} 当前用户不可写，将使用 sudo）"
+        echo
+        sudo npm install -g @deepseek-ai/dsh 2>&1 || ret=$?
+    else
+        npm install -g @deepseek-ai/dsh 2>&1 || ret=$?
+    fi
+    
     if [ $ret -ne 0 ]; then
-        err "npm更新失败"
-        echo "提示：如果遇到依赖冲突，可以手动执行："
-        echo "  sudo npm install -g @deepseek-ai/dsh"
-        echo "  或"
-        echo "  sudo npm install -g @deepseek-ai/dsh --force"
+        err "npm 安装/更新失败"
+        echo "可尝试手动执行："
+        if [ "$npm_need_sudo" -eq 1 ]; then
+            echo "  sudo npm install -g @deepseek-ai/dsh"
+            echo "  依赖冲突时可加 --force："
+            echo "  sudo npm install -g @deepseek-ai/dsh --force"
+        else
+            echo "  npm install -g @deepseek-ai/dsh"
+            echo "  依赖冲突时可加 --force："
+            echo "  npm install -g @deepseek-ai/dsh --force"
+        fi
         return 1
     fi
     
-    # 显示新版本
-    local new_version=$(get_dsh_version)
-    echo
-    info "更新完成"
-    echo "旧版本：$current_version"
-    echo "新版本：$new_version"
+    # npm 刚写入的 bin 可能还在 shell 的哈希缓存里，先清掉再探测
+    hash -r 2>/dev/null || true
     
-    # 如果服务已初始化，重启服务
+    # ---------- 校验安装结果 ----------
+    if ! check_dsh_installed; then
+        err "安装命令已返回成功，但仍找不到 dsh 可执行文件"
+        if [ -n "$npm_prefix" ]; then
+            echo "  npm 全局前缀：$npm_prefix"
+            echo "  可执行文件通常在 $npm_prefix/bin，请确认它在 PATH 中："
+            echo "    export PATH=\"$npm_prefix/bin:\$PATH\""
+            echo "  需要的话写入 shell 配置后重新登录："
+            echo "    echo 'export PATH=\"$npm_prefix/bin:\$PATH\"' >> ~/.bashrc"
+        fi
+        return 1
+    fi
+    
+    local new_version
+    new_version=$(get_dsh_version)
+    echo
+    if [ $installed -eq 1 ]; then
+        info "更新完成"
+        echo "旧版本：$current_version"
+        echo "新版本：$new_version"
+    else
+        info "安装完成"
+        echo "版本：$new_version"
+    fi
+    
+    # ---------- 服务处理 ----------
     local UNIT="/etc/systemd/system/${SVC}.service"
     if [ -f "$UNIT" ]; then
         echo
@@ -232,6 +287,13 @@ update_dsh() {
             info "服务重启成功"
         else
             err "服务重启失败，请查看日志"
+        fi
+    else
+        echo
+        if [ $installed -eq 0 ]; then
+            echo "提示：服务尚未初始化，可用菜单 7「初次初始化 Systemd 服务」创建。"
+        else
+            echo "提示：服务尚未初始化，可用菜单 7 创建后再启动。"
         fi
     fi
 }
@@ -2357,7 +2419,7 @@ menu() {
     echo "9. 卸载 systemd 服务"
     echo "10. 添加快捷命令到 .bashrc"
     echo "11. 移除快捷命令从 .bashrc"
-    echo "12. 更新 DSH 程序本体(npm)"
+    echo "12. 安装/更新 DSH 程序本体(npm)"
     echo
     echo "=== 备份与恢复 ==="
     echo "13. 备份与恢复管理"
@@ -2400,7 +2462,7 @@ while true; do
         9) uninstall_svc ;;
         10) add_alias_to_bashrc ;;
         11) remove_alias_from_bashrc ;;
-        12) update_dsh ;;
+        12) install_or_update_dsh ;;
         13) backup_restore_management ;;
         14) plugin_management ;;
         15) scan_and_fix_sessions ;;
