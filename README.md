@@ -28,6 +28,12 @@ curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install.sh 
 | `--from-file PATH` | 使用本地 `dsh.sh` 安装（离线安装） |
 | `-h`, `--help` | 显示帮助 |
 
+`raw.githubusercontent.com` 不稳定时（国内常见），安装器会自动切换到备用 CDN（jsDelivr），每个源都有限时，不会一直卡住。也可用环境变量指定自己的镜像：
+
+```bash
+DSH_EXTRA_MIRRORS=https://your-mirror/prefix bash <(curl -sSL .../install.sh)
+```
+
 > ⚠️ 不要写成 `sudo bash <(curl ...)`。
 > `<( )` 传的是进程私有的 `/dev/fd/N`，而 sudo 会关闭 3 及以上的 fd，
 > root 的 bash 打不开该路径，会报 `bash: /dev/fd/63: No such file or directory`

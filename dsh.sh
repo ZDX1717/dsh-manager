@@ -16,8 +16,13 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh}"
+# 下载超时：故意设得较短——有备用源兜底，宁可快速失败切换
+SCRIPT_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
+SCRIPT_MAX_TIME="${DSH_MAX_TIME:-30}"
+# 追加自定义镜像（空格分隔），例如国内加速前缀
+SCRIPT_EXTRA_MIRRORS="${DSH_EXTRA_MIRRORS:-}"
 
 # ========== 终端颜色 ==========
 if [ -t 1 ]; then
@@ -238,6 +243,45 @@ get_self_path() {
     printf '%s\n' "$p"
 }
 
+# ========== 更新源列表与下载（带超时与备用源） ==========
+# raw.githubusercontent.com 在国内经常被干扰，卡住/超时是常见现象，
+# 因此按顺序尝试多个源，任一成功即返回。
+script_update_urls() {
+    printf '%s\n' "$SCRIPT_RAW_URL"
+    
+    # 由 raw 地址推导 jsDelivr 等价地址（公开 CDN，回源 GitHub 仓库）
+    case "$SCRIPT_RAW_URL" in
+        *raw.githubusercontent.com/*/*/*/*)
+            local rest="${SCRIPT_RAW_URL#*raw.githubusercontent.com/}"
+            local owner="${rest%%/*}"; rest="${rest#*/}"
+            local repo="${rest%%/*}";  rest="${rest#*/}"
+            local ref="${rest%%/*}";   rest="${rest#*/}"
+            printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$ref/$rest"
+            ;;
+    esac
+    
+    local m
+    for m in $SCRIPT_EXTRA_MIRRORS; do
+        printf '%s\n' "${m%/}/$(basename "$SCRIPT_RAW_URL")"
+    done
+}
+
+download_self_update() {
+    local dest="$1" url
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        echo "  尝试：$url"
+        if curl -fsSL \
+                --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
+                --max-time "$SCRIPT_MAX_TIME" \
+                "$url" -o "$dest" 2>/dev/null && [ -s "$dest" ]; then
+            return 0
+        fi
+        echo "    失败或超时，换下一个源"
+    done < <(script_update_urls)
+    return 1
+}
+
 # ========== 更新管理脚本自身（菜单 00） ==========
 update_self() {
     title "更新管理脚本"
@@ -264,16 +308,17 @@ update_self() {
     fi
     
     echo "正在检查最新版本..."
+    echo "（每个源最多等待 ${SCRIPT_MAX_TIME}s）"
     local TMP
     TMP=$(mktemp "${TMPDIR:-/tmp}/dsh-manager-update.XXXXXX") || {
         err "无法创建临时文件"
         return 1
     }
     
-    if ! curl -fsSL --retry 3 --retry-delay 1 "$SCRIPT_RAW_URL" -o "$TMP" 2>/dev/null; then
-        err "下载失败，请检查网络"
-        echo "更新源：$SCRIPT_RAW_URL"
-        echo "提示：raw.githubusercontent.com 在国内可能不稳定，可稍后重试"
+    if ! download_self_update "$TMP"; then
+        err "所有下载源均失败"
+        echo "可用 DSH_EXTRA_MIRRORS 指定镜像后重试，例如："
+        echo "  DSH_EXTRA_MIRRORS=https://ghproxy.net/https://raw.githubusercontent.com/ZDX1717/dsh-manager/main dsh-manager"
         rm -f "$TMP"
         return 1
     fi

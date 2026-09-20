@@ -32,10 +32,57 @@ TARGET_BIN="$INSTALL_DIR/$TARGET_NAME"
 ALIAS_NAME="d"
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
 
+# 下载超时：故意设得较短——有备用源兜底，宁可快速失败切换，
+# 也不要在被干扰的源上长时间干等。
+CURL_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
+CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
+
 ASSUME_YES=0
 FROM_FILE=""
 ELEVATED_TMP=""
 PAYLOAD_TMP=""
+
+# 备用下载源。raw.githubusercontent.com 在国内经常被干扰，
+# 卡住或超时是常见现象，因此依次尝试。
+# jsDelivr 是公开 CDN，直接回源 GitHub 仓库内容；
+# 可用 DSH_EXTRA_MIRRORS 追加自定义镜像（空格分隔的 URL 前缀）。
+download_urls() {
+    local rel="$1"
+    printf '%s\n' "$RAW_BASE/$rel"
+    case "$RAW_BASE" in
+        *raw.githubusercontent.com/*)
+            # 从 RAW_BASE 解析出 owner/repo@ref，构造 jsDelivr 地址
+            local path="${RAW_BASE#*raw.githubusercontent.com/}"
+            local owner="${path%%/*}"
+            path="${path#*/}"
+            local repo="${path%%/*}"
+            local ref="${path#*/}"
+            printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$ref/$rel"
+            ;;
+    esac
+    local m
+    for m in ${DSH_EXTRA_MIRRORS:-}; do
+        printf '%s\n' "${m%/}/$rel"
+    done
+}
+
+# 依次尝试各下载源；任一成功即返回 0。全程有超时，不会永久挂起。
+download_file() {
+    local rel="$1" dest="$2"
+    local url
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        printf '  尝试 %s\n' "$url"
+        if curl -fsSL \
+                --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+                --max-time "$CURL_MAX_TIME" \
+                "$url" -o "$dest" 2>/dev/null && [ -s "$dest" ]; then
+            return 0
+        fi
+        printf '    失败或超时，换下一个源\n'
+    done < <(download_urls "$rel")
+    return 1
+}
 
 # ---------- 颜色 ----------
 if [ -t 1 ]; then
@@ -132,9 +179,14 @@ ensure_root() {
     # 进程替换 / 管道调用时 $0 不是普通文件，改为重新下载。
     if [ -f "$0" ] && cp -- "$0" "$tmp" 2>/dev/null; then
         :
-    elif ! curl -fsSL --retry 3 --retry-delay 1 "$SELF_URL" -o "$tmp"; then
-        err "重新下载安装脚本失败：$SELF_URL"
-        exit 1
+    else
+        echo "正在重新获取安装脚本..."
+        if ! download_file "$SELF_NAME" "$tmp"; then
+            err "重新下载安装脚本失败"
+            echo "可用 DSH_EXTRA_MIRRORS 指定自定义镜像后重试，例如："
+            echo "  DSH_EXTRA_MIRRORS=https://ghproxy.net/https://raw.githubusercontent.com/ZDX1717/dsh-manager/main bash install.sh"
+            exit 1
+        fi
     fi
 
     if [ ! -s "$tmp" ]; then
@@ -200,9 +252,13 @@ fetch_payload() {
         info "已从本地文件读取：$FROM_FILE"
     else
         title "下载 DSH 管理脚本"
-        echo "来源：$PAYLOAD_URL"
-        if ! curl -fsSL --retry 3 --retry-delay 1 "$PAYLOAD_URL" -o "$dest"; then
-            err "下载失败，请检查网络后重试"
+        echo "每个源最多等待 ${CURL_MAX_TIME}s（连接 ${CURL_CONNECT_TIMEOUT}s）"
+        if ! download_file "$PAYLOAD_NAME" "$dest"; then
+            err "所有下载源均失败"
+            echo "可指定自定义镜像后重试，例如："
+            echo "  DSH_EXTRA_MIRRORS=https://ghproxy.net/https://raw.githubusercontent.com/ZDX1717/dsh-manager/main bash install.sh"
+            echo "或直接下载到本地后离线安装："
+            echo "  bash install.sh --from-file /path/to/dsh.sh"
             return 1
         fi
     fi
