@@ -258,6 +258,34 @@ resolve_commit_sha() {
         | head -n 1
 }
 
+# 计算文件的 git blob 哈希：sha1("blob <字节数>\0" + 内容)
+# 用于和 GitHub API 登记的哈希比对
+git_blob_sha() {
+    local f="$1" size
+    command -v sha1sum >/dev/null 2>&1 || return 1
+    size=$(stat -c%s "$f" 2>/dev/null) || return 1
+    { printf 'blob %s\0' "$size"; cat -- "$f"; } | sha1sum | cut -d' ' -f1
+}
+
+# 校验下载内容与仓库登记是否一致。
+# 本脚本无法内置自身哈希（自引用矛盾），故改用 API 这个独立通道比对，
+# 可发现镜像篡改或 CDN 旧缓存。
+# 返回 0=一致  1=不一致  2=无法校验（API 不可达，不阻断更新）
+verify_via_api() {
+    local file="$1" owner="$2" repo="$3" path="$4" ref="$5"
+    local api_sha local_sha
+    api_sha="$(curl -fsSL \
+        --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
+        --max-time "$SCRIPT_MAX_TIME" \
+        "https://api.github.com/repos/$owner/$repo/contents/$path?ref=$ref" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+        | head -n 1)"
+    [ -n "$api_sha" ] || return 2
+    local_sha="$(git_blob_sha "$file")"
+    [ -n "$local_sha" ] || return 2
+    [ "$api_sha" = "$local_sha" ]
+}
+
 script_update_urls() {
     # 主源：raw（5 分钟缓存，最权威）
     printf '%s\n' "$SCRIPT_RAW_URL"
@@ -362,6 +390,26 @@ update_self() {
         rm -f "$TMP"
         return 1
     fi
+    
+    # 与仓库登记内容比对：能发现镜像篡改或 CDN 返回旧缓存
+    case "$SCRIPT_RAW_URL" in
+        *raw.githubusercontent.com/*/*/*/*)
+            local _rest="${SCRIPT_RAW_URL#*raw.githubusercontent.com/}"
+            local _owner="${_rest%%/*}"; _rest="${_rest#*/}"
+            local _repo="${_rest%%/*}";  _rest="${_rest#*/}"
+            local _ref="${_rest%%/*}";   local _file="${_rest#*/}"
+            local _vr=0
+            verify_via_api "$TMP" "$_owner" "$_repo" "$_file" "$_ref" || _vr=$?
+            case "$_vr" in
+                0) info "内容校验通过（与仓库登记一致）" ;;
+                1) err "下载内容与仓库登记不一致，可能是镜像篡改或旧缓存，已中止"
+                   echo "  如确认无误，可稍后重试或手动更新"
+                   rm -f "$TMP"
+                   return 1 ;;
+                2) warn "GitHub API 不可达，跳过内容比对（仅做了语法校验）" ;;
+            esac
+            ;;
+    esac
     
     local NEW_VER
     NEW_VER=$(grep -m1 '^SCRIPT_VERSION=' "$TMP" 2>/dev/null | cut -d'"' -f2)

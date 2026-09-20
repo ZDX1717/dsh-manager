@@ -37,7 +37,13 @@ PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
 CURL_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
 CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 
+# dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
+# 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
+# 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
+PAYLOAD_SHA256="99001ea6f51e35464c6ece445a512b91bdcd18e03d784b2bf0011af0d01e0b06"
+
 ASSUME_YES=0
+SKIP_VERIFY=0
 FROM_FILE=""
 ELEVATED_TMP=""
 PAYLOAD_TMP=""
@@ -90,9 +96,22 @@ download_urls() {
     done
 }
 
-# 依次尝试各下载源；任一成功即返回 0。全程有超时，不会永久挂起。
+# 校验下载到的 dsh.sh 是否与预期哈希一致
+verify_payload() {
+    local file="$1"
+    [ "$SKIP_VERIFY" -eq 1 ] && return 0
+    [ -n "$PAYLOAD_SHA256" ] || return 0
+    local actual
+    actual="$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)"
+    [ -n "$actual" ] || return 1
+    [ "$actual" = "$PAYLOAD_SHA256" ]
+}
+
+# 依次尝试各下载源；任一成功（且校验通过）即返回 0。
+# 全程有超时，不会永久挂起。
+# $3 = 1 时要求内容通过 SHA-256 校验，不通过则换下一个源。
 download_file() {
-    local rel="$1" dest="$2"
+    local rel="$1" dest="$2" need_verify="${3:-0}"
     local url
     while IFS= read -r url; do
         [ -n "$url" ] || continue
@@ -101,6 +120,10 @@ download_file() {
                 --connect-timeout "$CURL_CONNECT_TIMEOUT" \
                 --max-time "$CURL_MAX_TIME" \
                 "$url" -o "$dest" 2>/dev/null && [ -s "$dest" ]; then
+            if [ "$need_verify" -eq 1 ] && ! verify_payload "$dest"; then
+                printf '    ⚠ 内容与预期哈希不符，拒绝使用该源\n'
+                continue
+            fi
             return 0
         fi
         printf '    失败或超时，换下一个源\n'
@@ -133,10 +156,12 @@ DSH 管理脚本安装器
 选项：
   -y, --yes              跳过确认，直接安装
       --from-file PATH   使用本地 dsh.sh 安装（离线安装）
+      --skip-verify      跳过 dsh.sh 的 SHA-256 校验
   -h, --help             显示本帮助
 
 环境变量：
   DSH_RAW_BASE           自定义下载源前缀
+  DSH_EXTRA_MIRRORS      追加自定义镜像（空格分隔）
   DSH_INSTALL_DIR        安装目录（默认 /usr/local/bin）
 EOF
 }
@@ -153,10 +178,11 @@ trap cleanup EXIT
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -y|--yes)     ASSUME_YES=1 ;;
-            --from-file)  shift; FROM_FILE="${1:-}" ;;
-            -h|--help)    usage; exit 0 ;;
-            *)            warn "忽略未知参数：$1" ;;
+            -y|--yes)        ASSUME_YES=1 ;;
+            --from-file)     shift; FROM_FILE="${1:-}" ;;
+            --skip-verify)   SKIP_VERIFY=1 ;;
+            -h|--help)       usage; exit 0 ;;
+            *)               warn "忽略未知参数：$1" ;;
         esac
         shift || true
     done
@@ -274,16 +300,37 @@ fetch_payload() {
         fi
         cp -- "$FROM_FILE" "$dest"
         info "已从本地文件读取：$FROM_FILE"
+        warn "本地文件不做哈希校验（内容由你自行确认）"
     else
         title "下载 DSH 管理脚本"
         echo "每个源最多等待 ${CURL_MAX_TIME}s（连接 ${CURL_CONNECT_TIMEOUT}s）"
-        if ! download_file "$PAYLOAD_NAME" "$dest"; then
-            err "所有下载源均失败"
-            echo "可指定自定义镜像后重试，例如："
-            echo "  DSH_EXTRA_MIRRORS=https://ghproxy.net/https://raw.githubusercontent.com/ZDX1717/dsh-manager/main bash install.sh"
-            echo "或直接下载到本地后离线安装："
+        if [ "$SKIP_VERIFY" -eq 1 ]; then
+            warn "已通过 --skip-verify 关闭哈希校验"
+        else
+            echo "下载后将校验 SHA-256：${PAYLOAD_SHA256:0:16}…"
+        fi
+        if ! download_file "$PAYLOAD_NAME" "$dest" 1; then
+            err "所有下载源均失败，或内容未通过校验"
+            echo
+            echo "可能原因："
+            echo "  · 网络不通，或所有源都被干扰"
+            echo "  · 各源仍在 CDN 缓存期内、返回的是旧版本"
+            echo "    （刚更新过脚本时常见，等几分钟再试）"
+            echo "  · DSH_RAW_BASE 指向了 fork，内容与上游哈希不同"
+            echo
+            echo "期望哈希：$PAYLOAD_SHA256"
+            echo "用自定义镜像重试："
+            echo "  DSH_EXTRA_MIRRORS=<镜像前缀> bash install.sh"
+            echo "离线安装："
             echo "  bash install.sh --from-file /path/to/dsh.sh"
+            if [ "$SKIP_VERIFY" -eq 0 ]; then
+                echo "确认内容可信、要跳过校验："
+                echo "  bash install.sh --skip-verify"
+            fi
             return 1
+        fi
+        if [ "$SKIP_VERIFY" -eq 0 ]; then
+            info "SHA-256 校验通过"
         fi
     fi
 

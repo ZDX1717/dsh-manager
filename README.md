@@ -30,7 +30,10 @@ bash <(curl -sSL https://cdn.jsdelivr.net/gh/ZDX1717/dsh-manager@main/install.sh
 |------|------|
 | `-y`, `--yes` | 跳过确认，直接安装 |
 | `--from-file PATH` | 使用本地 `dsh.sh` 安装（离线安装） |
+| `--skip-verify` | 跳过 `dsh.sh` 的 SHA-256 校验 |
 | `-h`, `--help` | 显示帮助 |
+
+下载的 `dsh.sh` 会做 **SHA-256 校验**：镜像被篡改、或 CDN 返回旧缓存时会被识别并拒绝，自动改用下一个源。本地文件（`--from-file`）不做校验。
 
 下载时**会自动按顺序切换源**，每个源都有限时（连接 8s / 总计 30s），不会一直卡住：
 
