@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-manager</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #656d76;
+    --border: #d1d9e0;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #4493f8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+    max-width: 46rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC",
+          "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+  }
+  h1 { font-size: 1.75rem; margin: 0 0 .4rem; }
+  h2 { font-size: 1.1rem; margin: 2.5rem 0 .8rem; padding-bottom: .4rem;
+       border-bottom: 1px solid var(--border); }
+  p  { margin: .6rem 0; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  a { color: var(--accent); }
+  .cmd {
+    position: relative;
+    margin: 1rem 0;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .cmd pre {
+    margin: 0;
+    padding: 1rem 5.5rem 1rem 1rem;
+    overflow-x: auto;
+    font: 13.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  button {
+    position: absolute;
+    top: .6rem; right: .6rem;
+    padding: .3rem .7rem;
+    font: 12px/1.4 inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  .menu {
+    margin: 1rem 0;
+    padding: 1.1rem 1.25rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: 13.5px/1.85 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  footer {
+    margin-top: 3rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: .88rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>dsh-manager</h1>
+<p class="muted">DSH-Web 服务管理脚本 · 服务管理 / 插件管理 / 备份恢复 / 会话维护</p>
+
+<h2>安装</h2>
+<div class="cmd">
+  <pre id="install">bash &lt;(curl -sSL https://ZDX1717.github.io/dsh-manager/install.sh)</pre>
+  <button onclick="copyCmd()">复制</button>
+</div>
+<p class="muted">不需要加 <code>sudo</code>，安装器会自动提权。安装后重新登录（或 <code>source ~/.bashrc</code>），用 <code>dsh-manager</code> 打开面板。</p>
+
+<h2>备用安装地址</h2>
+<div class="cmd">
+  <pre># GitHub Pages 不通时
+bash &lt;(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install.sh)
+
+# 或
+bash &lt;(curl -sSL https://cdn.jsdelivr.net/gh/ZDX1717/dsh-manager@main/install.sh)</pre>
+</div>
+
+<h2>功能菜单</h2>
+<div class="menu">=== 服务管理 ===
+1. 启动
+2. 停止
+3. 重启
+4. 查看状态
+
+=== 访问与调试 ===
+5. 获取 Token 访问链接
+6. 查看实时日志
+
+=== 安装与配置 ===
+7. 初次初始化 Systemd 服务
+8. 修改 systemd 服务名称
+9. 卸载 systemd 服务
+10. 添加快捷命令到 .bashrc
+11. 移除快捷命令从 .bashrc
+12. 更新 DSH 程序本体(npm)
+
+=== 备份与恢复 ===
+13. 备份与恢复管理
+
+=== 插件管理 ===
+14. 插件管理
+
+=== 会话维护 ===
+15. 扫描并修复会话文件
+
+00. 更新管理脚本
+
+0. 退出脚本</div>
+
+<footer>
+  <a href="https://github.com/ZDX1717/dsh-manager">GitHub 仓库</a> ·
+  <a href="https://github.com/ZDX1717/dsh-manager/blob/main/README.md">README</a> ·
+  MIT License
+</footer>
+
+<script>
+function copyCmd() {
+  var text = document.getElementById('install').textContent;
+  var done = function () {
+    var b = document.querySelector('button');
+    b.textContent = '已复制';
+    setTimeout(function () { b.textContent = '复制'; }, 1500);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else {
+    fallback();
+  }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+}
+</script>
+
+</body>
+</html>
