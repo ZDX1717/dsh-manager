@@ -1,7 +1,16 @@
 #!/bin/bash
 
 # DSH 管理脚本一键安装器
-# 使用方法：bash <(curl -sSL https://raw.githubusercontent.com/your-repo/dsh-manager/main/install_dsh_manager.sh)
+#
+# 推荐安装方式（先下载再执行，最稳）：
+#   curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh -o /tmp/dsh_install.sh
+#   sudo bash /tmp/dsh_install.sh
+#
+# 也支持管道方式（脚本会自动从 /dev/tty 读取确认）：
+#   curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh | sudo bash
+#
+# 注意：不要用 `sudo bash <(curl ...)`，sudo 下 /dev/fd 不可用会报
+#       "/dev/fd/63: No such file or directory"。
 
 set -e
 
@@ -17,6 +26,23 @@ info()  { printf "${GRN}${BLD}[完成]${RST} %s\n" "$1"; }
 warn()  { printf "${YEL}${BLD}[提示]${RST} %s\n" "$1"; }
 err()   { printf "${RED}${BLD}[错误]${RST} %s\n" "$1"; }
 title() { printf "\n${BLD}==== %s ====${RST}\n" "$1"; }
+
+# 交互确认：管道执行时 stdin 是脚本内容，必须改从 /dev/tty 读，
+# 否则会把脚本文本当成用户输入吃掉。
+# 注意：不能只用 [ -r /dev/tty ] 判断——该文件可能存在但打不开
+# （容器/无控制终端环境），这里用真实打开来探测。
+confirm() {
+    local prompt="$1" answer=""
+    if [ -t 0 ]; then
+        read -r -p "$prompt" answer || answer=""
+    elif { true; } 2>/dev/null < /dev/tty; then
+        read -r -p "$prompt" answer < /dev/tty
+    else
+        warn "非交互环境，默认继续安装（如需取消请用 Ctrl+C）"
+        answer="y"
+    fi
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
 
 # 配置
 INSTALL_DIR="/usr/local/bin"
@@ -190,21 +216,19 @@ show_info() {
 main() {
     title "DSH 管理脚本安装器"
     
+    # 检查 root 权限
+    check_root
+    
     echo "此脚本将安装 DSH 管理脚本到您的系统"
     echo
     echo "安装位置：$INSTALL_DIR/$SCRIPT_NAME"
     echo "快捷命令：d"
     echo
     
-    read -r -p "确认安装？(y/N): " CONFIRM
-    
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    if ! confirm "确认安装？(y/N): "; then
         warn "安装已取消"
         exit 0
     fi
-    
-    # 检查 root 权限
-    check_root
     
     # 检查依赖
     check_dependencies

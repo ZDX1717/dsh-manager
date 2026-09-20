@@ -5,8 +5,19 @@ DSH-Web 服务管理脚本。基于 systemd 管理 DSH 服务，并提供插件�
 ## 一键安装
 
 ```bash
-sudo bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh)
+curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh -o /tmp/dsh_install.sh && sudo bash /tmp/dsh_install.sh
 ```
+
+也支持管道方式（脚本会自动从 `/dev/tty` 读取确认）：
+
+```bash
+curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh | sudo bash
+```
+
+> ⚠️ 不要用 `sudo bash <(curl -sSL ...)`。
+> `sudo` 下 `/dev/fd/63` 不可访问，会报
+> `bash: /dev/fd/63: No such file or directory` 和 `curl: (23) Failure writing output to destination`。
+> 这是进程替换与 sudo 的兼容问题，不是脚本本身的问题。
 
 安装完成后可直接使用快捷命令 `d` 打开管理面板。
 
