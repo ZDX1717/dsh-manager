@@ -15,6 +15,10 @@ SVC="dsh-web"
 DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
+# 本脚本自身版本与更新源（菜单 00 使用）
+SCRIPT_VERSION="1.1.0"
+SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh}"
+
 # ========== 终端颜色 ==========
 if [ -t 1 ]; then
     RST=$'\033[0m'
@@ -220,6 +224,141 @@ update_dsh() {
             err "服务重启失败，请查看日志"
         fi
     fi
+}
+
+# ========== 获取本脚本的真实路径 ==========
+get_self_path() {
+    local p="$0"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$p" 2>/dev/null && return 0
+    fi
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f "$p" 2>/dev/null && return 0
+    fi
+    printf '%s\n' "$p"
+}
+
+# ========== 更新管理脚本自身（菜单 00） ==========
+update_self() {
+    title "更新管理脚本"
+    
+    local SELF
+    SELF=$(get_self_path)
+    
+    # 通过 bash <(curl ...) 之类方式运行时，$0 不是真实文件，无法原地替换
+    if [ ! -f "$SELF" ]; then
+        err "无法定位脚本文件（当前以 $0 运行）"
+        echo "请先安装后再使用本功能："
+        echo "  bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh)"
+        return 1
+    fi
+    
+    echo "脚本路径：$SELF"
+    echo "当前版本：$SCRIPT_VERSION"
+    
+    # 权限检查：需要能写文件本身，或至少能写它所在目录
+    if [ ! -w "$SELF" ] && [ ! -w "$(dirname "$SELF")" ]; then
+        err "没有写入权限：$SELF"
+        echo "请以 root 身份运行后再更新"
+        return 1
+    fi
+    
+    echo "正在检查最新版本..."
+    local TMP
+    TMP=$(mktemp "${TMPDIR:-/tmp}/dsh-manager-update.XXXXXX") || {
+        err "无法创建临时文件"
+        return 1
+    }
+    
+    if ! curl -fsSL --retry 3 --retry-delay 1 "$SCRIPT_RAW_URL" -o "$TMP" 2>/dev/null; then
+        err "下载失败，请检查网络"
+        echo "更新源：$SCRIPT_RAW_URL"
+        echo "提示：raw.githubusercontent.com 在国内可能不稳定，可稍后重试"
+        rm -f "$TMP"
+        return 1
+    fi
+    
+    # 校验下载内容，避免用坏文件覆盖掉可用脚本
+    if [ ! -s "$TMP" ]; then
+        err "下载内容为空，已中止"
+        rm -f "$TMP"
+        return 1
+    fi
+    if ! head -n1 "$TMP" | grep -q '^#!'; then
+        err "下载内容不是有效的 Shell 脚本，已中止"
+        rm -f "$TMP"
+        return 1
+    fi
+    if ! bash -n "$TMP" 2>/dev/null; then
+        err "下载脚本语法校验未通过，已中止"
+        rm -f "$TMP"
+        return 1
+    fi
+    
+    local NEW_VER
+    NEW_VER=$(grep -m1 '^SCRIPT_VERSION=' "$TMP" 2>/dev/null | cut -d'"' -f2)
+    [ -n "$NEW_VER" ] || NEW_VER="未知"
+    echo "最新版本：$NEW_VER"
+    
+    # 用内容哈希判断是否需要更新（比版本号更可靠）
+    local OLD_SUM NEW_SUM
+    OLD_SUM=$(sha256sum "$SELF" 2>/dev/null | cut -d' ' -f1)
+    NEW_SUM=$(sha256sum "$TMP" 2>/dev/null | cut -d' ' -f1)
+    
+    if [ -n "$OLD_SUM" ] && [ "$OLD_SUM" = "$NEW_SUM" ]; then
+        info "已是最新版本，无需更新"
+        rm -f "$TMP"
+        return 0
+    fi
+    
+    echo
+    if [ "$SCRIPT_VERSION" = "$NEW_VER" ]; then
+        warn "版本号相同但内容有变化，仍建议更新"
+    fi
+    read -r -p "确认更新？(y/N): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "操作已取消"
+        rm -f "$TMP"
+        return 0
+    fi
+    
+    # 备份当前版本
+    local BAK="${SELF}.bak"
+    if cp -p "$SELF" "$BAK" 2>/dev/null; then
+        echo "已备份：$BAK"
+    else
+        warn "备份失败，继续更新"
+    fi
+    
+    # 先落到同目录的临时文件，再 rename 覆盖，保证原子替换
+    # （脚本正在运行，rename 不会打断当前进程）
+    local STAGED="${SELF}.new.$$"
+    if ! install -m 0755 "$TMP" "$STAGED" 2>/dev/null; then
+        err "写入失败，请检查权限"
+        rm -f "$TMP" "$STAGED"
+        return 1
+    fi
+    rm -f "$TMP"
+    
+    if ! mv -f "$STAGED" "$SELF" 2>/dev/null; then
+        err "替换失败，原脚本未受影响"
+        rm -f "$STAGED"
+        return 1
+    fi
+    
+    # 若存在 /usr/bin 下的软链，保持指向不变
+    local LINK="/usr/bin/$(basename "$SELF")"
+    if [ -L "$LINK" ]; then
+        ln -sf "$SELF" "$LINK" 2>/dev/null
+    fi
+    
+    echo
+    info "更新完成"
+    echo "旧版本：$SCRIPT_VERSION"
+    echo "新版本：$NEW_VER"
+    echo
+    echo "提示：重新运行脚本即可使用新版本"
+    echo "  备份文件：$BAK"
 }
 
 # ========== 永久把 SVC 写入本脚本文件 ==========
@@ -1955,6 +2094,8 @@ menu() {
     echo "=== 会话维护 ==="
     echo "15. 扫描并修复会话文件"
     echo
+    echo "00. 更新管理脚本"
+    echo
     echo "0. 退出脚本"
     echo
     printf "请输入选项："
@@ -1966,7 +2107,13 @@ trap cleanup_animation EXIT INT TERM
 
 while true; do
     menu
-    read -r opt
+    # stdin 到 EOF（如 < /dev/null、管道结束）时必须退出，
+    # 否则 read 立即返回空值会让菜单无限刷屏
+    if ! read -r opt; then
+        echo
+        echo "已退出"
+        exit 0
+    fi
     case $opt in
         1) start_svc ;;
         2) stop_svc ;;
@@ -1983,12 +2130,13 @@ while true; do
         13) backup_restore_management ;;
         14) plugin_management ;;
         15) scan_and_fix_sessions ;;
+        00) update_self ;;
         0) echo "已退出"; exit 0 ;;
         *) warn "无效选项" ;;
     esac
 
     echo
     printf "按回车继续..."
-    read -r null
+    read -r null || { echo; echo "已退出"; exit 0; }
 done
 

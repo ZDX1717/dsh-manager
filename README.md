@@ -67,5 +67,7 @@ curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh
 === 会话维护 ===
 15. 扫描并修复会话文件
 
+00. 更新管理脚本
+
 0. 退出脚本
 ```
