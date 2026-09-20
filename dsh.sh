@@ -269,6 +269,10 @@ script_update_urls() {
             local owner="${rest%%/*}"; rest="${rest#*/}"
             local repo="${rest%%/*}";  rest="${rest#*/}"
             local ref="${rest%%/*}";   local file="${rest#*/}"
+
+            # GitHub Pages：另一个 CDN，与 raw 同时故障概率更低
+            printf '%s\n' "https://$owner.github.io/$repo/$file"
+
             local sha
             sha="$(resolve_commit_sha "$owner" "$repo" "$ref" || true)"
             if [ -n "$sha" ]; then

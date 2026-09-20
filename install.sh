@@ -69,6 +69,11 @@ download_urls() {
             local owner="${path%%/*}"; path="${path#*/}"
             local repo="${path%%/*}"
             local ref="${path#*/}"
+
+            # GitHub Pages：另一个 CDN（Fastly），与 raw 同时故障的概率更低
+            printf '%s\n' "https://$owner.github.io/$repo/$rel"
+
+            # jsDelivr：优先用 commit SHA 寻址（内容不可变，避免分支缓存滞后 12h）
             local sha
             sha="$(resolve_commit_sha "$owner" "$repo" "$ref" || true)"
             if [ -n "$sha" ]; then
@@ -315,6 +320,19 @@ install_payload() {
 }
 
 # ---------- 快捷命令 ----------
+# 检查某个 rc 文件里快捷别名是否可用
+# 返回 0=未占用  1=已指向本脚本  2=已被别的命令占用（不要覆盖）
+alias_state() {
+    local rc="$1"
+    if grep -qE "^alias[[:space:]]+$ALIAS_NAME=['\"]$TARGET_NAME['\"]" "$rc" 2>/dev/null; then
+        return 1
+    fi
+    if grep -qE "^alias[[:space:]]+$ALIAS_NAME=" "$rc" 2>/dev/null; then
+        return 2
+    fi
+    return 0
+}
+
 setup_alias() {
     title "配置快捷命令"
 
@@ -340,10 +358,23 @@ EOF
     fi
 
     local rc="$home/.bashrc"
-    if grep -q "^alias $ALIAS_NAME='$TARGET_NAME'" "$rc" 2>/dev/null; then
-        info "$rc 中已存在快捷命令，跳过"
-        return 0
-    fi
+    local st=0
+    alias_state "$rc" || st=$?
+
+    case "$st" in
+        1)
+            info "$rc 中已存在快捷命令，跳过"
+            return 0
+            ;;
+        2)
+            # 不能默默追加：后定义的别名会盖掉用户原有的，属于静默破坏
+            warn "$rc 中 $ALIAS_NAME 已被占用，为避免覆盖已跳过"
+            echo "  现有定义：$(grep -E "^alias[[:space:]]+$ALIAS_NAME=" "$rc" | head -n 1)"
+            echo "  如需改用本脚本，请先删除该行后重新运行安装器，"
+            echo "  或直接用完整命令：$TARGET_NAME"
+            return 0
+            ;;
+    esac
 
     {
         echo ""
