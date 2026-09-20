@@ -40,7 +40,7 @@ CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 # dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
 # 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
 # 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
-PAYLOAD_SHA256="99001ea6f51e35464c6ece445a512b91bdcd18e03d784b2bf0011af0d01e0b06"
+PAYLOAD_SHA256="e5235da367dcd0e11c355c92a42484b1a8e5906523e7959061bc2d914d6dd121"
 
 ASSUME_YES=0
 SKIP_VERIFY=0
@@ -221,7 +221,10 @@ ensure_root() {
 
     warn "当前用户 $(id -un) 非 root，提权后继续"
     local tmp
-    tmp="$(mktemp "${TMPDIR:-/tmp}/dsh-installer.XXXXXX")"
+    if ! tmp="$(mktemp "${TMPDIR:-/tmp}/dsh-installer.XXXXXX" 2>/dev/null)"; then
+        err "无法创建临时文件（检查 TMPDIR 是否可写）：${TMPDIR:-/tmp}"
+        exit 1
+    fi
     # 立刻登记，保证后面任何分支提前退出时都会被 EXIT trap 清理
     ELEVATED_TMP="$tmp"
 
@@ -230,6 +233,16 @@ ensure_root() {
     if [ -f "$0" ] && cp -- "$0" "$tmp" 2>/dev/null; then
         :
     else
+        # 只有走"重新下载自身"这条路才依赖 curl，缺了要直接说清楚，
+        # 否则会一路报成"下载失败"，误导排查方向
+        if ! command -v curl >/dev/null 2>&1; then
+            err "需要 curl 重新获取安装脚本，但系统未安装 curl"
+            echo "请先安装 curl 后重试，例如："
+            echo "  sudo apt install -y curl     # Debian/Ubuntu"
+            echo "  sudo dnf install -y curl     # Fedora/RHEL"
+            echo "或先把本脚本下载到本地，再以文件方式运行。"
+            exit 1
+        fi
         echo "正在重新获取安装脚本..."
         if ! download_file "$SELF_NAME" "$tmp"; then
             err "重新下载安装脚本失败"
@@ -243,14 +256,31 @@ ensure_root() {
         err "取到的安装脚本为空"
         exit 1
     fi
+    # 执行前先做语法校验：这个文件马上要以 root 跑
+    if ! bash -n "$tmp" 2>/dev/null; then
+        err "取到的安装脚本语法校验未通过，已中止（可能下载不完整）"
+        exit 1
+    fi
     chmod +x "$tmp"
 
+    # 选项与环境变量都必须显式传给 root 子进程：
+    # sudo 默认 env_reset 会丢掉所有 DSH_* 变量，
+    # 且原先只转发了 --yes，导致 --from-file/--skip-verify 静默失效。
+    local -a fwd=()
+    [ "$ASSUME_YES" -eq 1 ] && fwd+=(--yes)
+    [ "$SKIP_VERIFY" -eq 1 ] && fwd+=(--skip-verify)
+    [ -n "$FROM_FILE" ] && fwd+=(--from-file "$FROM_FILE")
+
     local rc=0
-    if [ "$ASSUME_YES" -eq 1 ]; then
-        sudo bash "$tmp" --yes || rc=$?
-    else
-        sudo bash "$tmp" || rc=$?
-    fi
+    # 用 sudo env 显式带入变量（-E 在多数发行版被 sudoers 禁用，不可靠）
+    sudo env \
+        DSH_RAW_BASE="$RAW_BASE" \
+        DSH_EXTRA_MIRRORS="${DSH_EXTRA_MIRRORS:-}" \
+        DSH_INSTALL_DIR="$INSTALL_DIR" \
+        DSH_PROFILE_FILE="$PROFILE_FILE" \
+        DSH_CONNECT_TIMEOUT="$CURL_CONNECT_TIMEOUT" \
+        DSH_MAX_TIME="$CURL_MAX_TIME" \
+        bash "$tmp" ${fwd[@]+"${fwd[@]}"} || rc=$?
 
     # 关键：无论提权成功与否都必须结束当前（非 root）进程，
     # 否则会以无权限身份继续执行后面的安装步骤。
@@ -261,18 +291,26 @@ ensure_root() {
 check_deps() {
     if ! command -v curl >/dev/null 2>&1; then
         warn "未找到 curl，尝试安装..."
+        local installed=0
+        # 统一用 if 包裹：裸命令在 set -e 下失败会静默终止脚本
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y curl
+            if apt-get update -qq && apt-get install -y curl; then installed=1; fi
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y curl
+            if dnf install -y curl; then installed=1; fi
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y curl
+            if yum install -y curl; then installed=1; fi
         elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache curl
+            if apk add --no-cache curl; then installed=1; fi
         else
-            err "无法自动安装 curl，请手动安装后重试"
+            err "未找到可用的包管理器，请手动安装 curl 后重试"
             exit 1
         fi
+
+        if [ "$installed" -ne 1 ] || ! command -v curl >/dev/null 2>&1; then
+            err "自动安装 curl 失败，请手动安装后重试"
+            exit 1
+        fi
+        info "curl 安装完成"
     fi
 
     # jq / rsync / zstd 都是可选，缺了也能装，只提示不强制安装
@@ -284,7 +322,11 @@ check_deps() {
     if [ -n "$missing" ]; then
         missing="${missing# }"
         warn "可选依赖未安装：$missing"
-        echo "  jq=插件配置管理  rsync=更稳的备份/恢复  zstd=会话文件校验"
+        echo "  缺失影响："
+        echo "    jq       删除插件时必须（要同步修改 package.json 的 bundles）"
+        echo "             没有 jq 时若有 python3 也能用，两者都缺则无法删插件"
+        echo "    rsync    备份/恢复用更稳的复制方式"
+        echo "    zstd     会话文件完整性校验"
         echo "  安装示例：apt install -y $missing"
     fi
 }
@@ -355,9 +397,18 @@ install_payload() {
     title "安装"
 
     if [ ! -d "$INSTALL_DIR" ]; then
-        install -d -m 0755 "$INSTALL_DIR"
+        if ! install -d -m 0755 "$INSTALL_DIR" 2>/dev/null; then
+            err "无法创建安装目录：$INSTALL_DIR"
+            echo "  请检查权限，或用 DSH_INSTALL_DIR 指定其它目录"
+            return 1
+        fi
     fi
-    install -m 0755 "$src" "$TARGET_BIN"
+
+    if ! install -m 0755 "$src" "$TARGET_BIN" 2>/dev/null; then
+        err "无法写入 $TARGET_BIN"
+        echo "  请检查权限（本脚本需以 root 运行）"
+        return 1
+    fi
     info "主脚本安装到 $TARGET_BIN"
 
     # /usr/local/bin 通常在 PATH 里；补一个 /usr/bin 软链兜底
@@ -399,7 +450,9 @@ EOF
     [ "$login_user" = "root" ] && login_user="${SUDO_USER:-root}"
 
     local home
-    home="$(getent passwd "$login_user" 2>/dev/null | cut -d: -f6)"
+    # 末尾的 || true 必不可少：getent 对不存在的用户返回 2，
+    # 而本函数是在非条件上下文中调用的，set -e 会因此静默终止整个安装
+    home="$(getent passwd "$login_user" 2>/dev/null | cut -d: -f6 || true)"
     if [ -z "$home" ] || [ ! -f "$home/.bashrc" ]; then
         return 0
     fi
@@ -469,7 +522,10 @@ main() {
         exit 0
     fi
 
-    PAYLOAD_TMP="$(mktemp "${TMPDIR:-/tmp}/dsh-payload.XXXXXX")"
+    if ! PAYLOAD_TMP="$(mktemp "${TMPDIR:-/tmp}/dsh-payload.XXXXXX" 2>/dev/null)"; then
+        err "无法创建临时文件（检查 TMPDIR 是否可写）：${TMPDIR:-/tmp}"
+        exit 1
+    fi
 
     if ! fetch_payload "$PAYLOAD_TMP"; then
         err "安装失败"

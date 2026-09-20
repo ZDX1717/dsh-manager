@@ -3,8 +3,12 @@
 # 仅支持 bash，不兼容 dash/sh
 # 功能：初始化systemd、启动、停止、重启、状态、获取token链接、修改服务名、更新dsh、卸载、日志查看、插件管理
 
-# ========== 脚本自检：禁止dash/sh运行 ==========
-if [ "$(basename "$SHELL")" != "bash" ] && [ "$(readlink /bin/sh)" = "dash" ];then
+# ========== 脚本自检：禁止 dash/sh 运行 ==========
+# 判断"当前解释器是不是 bash"，而不是看 $SHELL。
+# $SHELL 是登录 shell 环境变量（可能继承自 zsh/fish），
+# 与"本脚本由哪个解释器执行"无关，用它判断会误杀
+# 「登录 shell 是 zsh、但确实用 bash 运行本脚本」的用户。
+if [ -z "${BASH_VERSION:-}" ]; then
     echo "❌ 本脚本必须使用 bash 运行，不要用 sh/dash"
     echo "执行方式：bash $0"
     exit 1
@@ -16,7 +20,8 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
+TARGET_NAME="dsh-manager"
 SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh}"
 # 下载超时：故意设得较短——有备用源兜底，宁可快速失败切换
 SCRIPT_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
@@ -351,11 +356,17 @@ update_self() {
     echo "脚本路径：$SELF"
     echo "当前版本：$SCRIPT_VERSION"
     
-    # 权限检查：需要能写文件本身，或至少能写它所在目录
-    if [ ! -w "$SELF" ] && [ ! -w "$(dirname "$SELF")" ]; then
-        err "没有写入权限：$SELF"
-        echo "请以 root 身份运行后再更新"
-        return 1
+    # 权限检查：实现是先在本目录建 "$SELF.new.$$" 再 mv 覆盖，
+    # 所以真正需要的是"目录可写"，只判断文件本身可写会误判
+    # （文件可写但目录不可写时，会在最后一步才失败）。
+    if [ ! -w "$(dirname "$SELF")" ]; then
+        if [ -w "$SELF" ]; then
+            warn "脚本所在目录不可写，将直接覆盖文件内容（非原子操作）"
+        else
+            err "没有写入权限：$SELF"
+            echo "请以 root 身份运行后再更新"
+            return 1
+        fi
     fi
     
     echo "正在检查最新版本..."
@@ -448,17 +459,24 @@ update_self() {
     
     # 先落到同目录的临时文件，再 rename 覆盖，保证原子替换
     # （脚本正在运行，rename 不会打断当前进程）
+    # 优先原子替换：先落同目录临时文件，再 rename 覆盖
+    # （脚本正在运行，rename 不会打断当前进程）。
+    # 目录不可写时回退为直接覆盖内容 —— 非原子，但那是唯一可行方式。
     local STAGED="${SELF}.new.$$"
-    if ! install -m 0755 "$TMP" "$STAGED" 2>/dev/null; then
-        err "写入失败，请检查权限"
-        rm -f "$TMP" "$STAGED"
-        return 1
+    local replaced=0
+    if install -m 0755 "$TMP" "$STAGED" 2>/dev/null && mv -f "$STAGED" "$SELF" 2>/dev/null; then
+        replaced=1
+    else
+        rm -f "$STAGED" 2>/dev/null
+        if cat -- "$TMP" > "$SELF" 2>/dev/null; then
+            chmod 0755 "$SELF" 2>/dev/null || true
+            replaced=1
+        fi
     fi
     rm -f "$TMP"
     
-    if ! mv -f "$STAGED" "$SELF" 2>/dev/null; then
+    if [ $replaced -ne 1 ]; then
         err "替换失败，原脚本未受影响"
-        rm -f "$STAGED"
         return 1
     fi
     
@@ -739,12 +757,20 @@ rename_svc() {
     sysctl disable "$SVC" >/dev/null 2>&1
 
     echo "正在重命名服务文件..."
+    # 必须确认新 unit 写成功再删旧的，否则 cp 失败会同时失去新旧两份
+    local _cp_ok=0
     if [ "$(id -u)" -eq 0 ]; then
-        cp "$OLD_UNIT" "$NEW_UNIT"
-        rm -f "$OLD_UNIT"
+        cp "$OLD_UNIT" "$NEW_UNIT" 2>/dev/null && _cp_ok=1
+        [ $_cp_ok -eq 1 ] && rm -f "$OLD_UNIT" 2>/dev/null
     else
-        sudo cp "$OLD_UNIT" "$NEW_UNIT"
-        sudo rm -f "$OLD_UNIT"
+        sudo cp "$OLD_UNIT" "$NEW_UNIT" 2>/dev/null && _cp_ok=1
+        [ $_cp_ok -eq 1 ] && sudo rm -f "$OLD_UNIT" 2>/dev/null
+    fi
+    if [ $_cp_ok -ne 1 ]; then
+        err "重命名服务文件失败，原服务文件未改动"
+        echo "  源：$OLD_UNIT"
+        echo "  目标：$NEW_UNIT"
+        return 1
     fi
 
     echo "正在重新加载 systemd 配置..."
@@ -1244,22 +1270,49 @@ restore_sessions() {
     ANIMATION_PID=$!
     
     # 使用 rsync 或 tar 来确保恢复的完整性
+    local restore_result=0
     if command -v rsync >/dev/null 2>&1; then
         # 使用 rsync 恢复，但不使用 --delete 选项，避免删除用户其他数据
-        rsync -a "$temp_restore_dir/.dsh/" "$dsh_dir/" 2>/dev/null
+        if ! rsync -a "$temp_restore_dir/.dsh/" "$dsh_dir/" 2>/dev/null; then
+            restore_result=1
+        fi
     else
-        # 如果没有 rsync，先备份当前目录，然后恢复
-        local backup_current_dir=$(mktemp -d)
+        # 没有 rsync：改为"先移开、再落盘、成功才删"，
+        # 绝不在未确认可回退的情况下 rm -rf 用户数据。
+        local stash="${dsh_dir}.old.$$"
+        local moved=0
         if [ -d "$dsh_dir" ]; then
-            tar -cf - -C "$HOME" .dsh | tar -xf - -C "$backup_current_dir" 2>/dev/null
+            if ! mv "$dsh_dir" "$stash" 2>/dev/null; then
+                cleanup_animation
+                rm -rf "$temp_restore_dir"
+                printf " 失败\n"
+                err "无法暂存当前数据目录，已中止恢复（未做任何删除）"
+                echo "  目标：$dsh_dir"
+                return 1
+            fi
+            moved=1
         fi
         
-        # 清除当前目录并恢复
-        rm -rf "$dsh_dir" 2>/dev/null
-        tar -cf - -C "$temp_restore_dir" .dsh | tar -xf - -C "$HOME" 2>/dev/null
+        if ! tar -cf - -C "$temp_restore_dir" .dsh 2>/dev/null | tar -xf - -C "$HOME" 2>/dev/null; then
+            restore_result=1
+        fi
+        
+        # 解压出来的目录必须存在且非空，否则视为失败并回滚
+        if [ $restore_result -eq 0 ] && [ ! -d "$dsh_dir" ]; then
+            restore_result=1
+        fi
+        
+        if [ $restore_result -ne 0 ]; then
+            rm -rf "$dsh_dir" 2>/dev/null
+            if [ $moved -eq 1 ]; then
+                mv "$stash" "$dsh_dir" 2>/dev/null
+                echo
+                warn "恢复失败，已回滚到原数据"
+            fi
+        elif [ $moved -eq 1 ]; then
+            rm -rf "$stash" 2>/dev/null
+        fi
     fi
-    
-    local restore_result=$?
     
     # 停止动画
     cleanup_animation
@@ -1611,7 +1664,7 @@ backup_restore_management() {
         echo "4. 测试备份恢复"
         echo "0. 返回"
         echo
-        read -r -p "请选择操作： " choice
+        read -r -p "请选择操作： " choice || { echo; return 0; }
         
         case $choice in
             1)
@@ -1640,7 +1693,7 @@ backup_restore_management() {
         
         echo
         printf "按回车继续..."
-        read -r null
+        read -r null || { echo; return 0; }
     done
 }
 
@@ -1660,8 +1713,80 @@ get_current_profile() {
     echo "$profile"
 }
 
+# ========== 插件名解析 ==========
+# pnpm list 输出形如 name@version；scoped 包是 @scope/name@version。
+# 不能用 cut -d'@' -f1（对 scoped 包会得到空串，导致状态误判、
+# 启用/禁用操作对象为空）。这里只剥掉"以数字开头的版本段"，
+# 从而兼容 @scope/name（无版本）这类输入。
+plugin_name_of() {
+    printf '%s\n' "$1" | sed 's/@[0-9][^@]*$//'
+}
+
+# ========== JSON 编辑能力检测 ==========# 删除插件必须同步修改 package.json 的 dsh.profile.bundles，
+# 否则 dependencies 已移除而 bundles 仍残留，DSH 启动会报
+# cannot resolve profile bundle。优先 jq，退化到 python3。
+json_tool() {
+    if command -v jq >/dev/null 2>&1; then
+        echo "jq"
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3"
+        return 0
+    fi
+    return 1
+}
+
+# 从 package.json 的 bundles 中移除指定包名
+# 返回 0=成功  1=失败  2=无可用工具
+remove_from_bundles() {
+    local pkg="$1"
+    local file="package.json"
+    local tmp tool
+    tmp=$(mktemp) || return 1
+    tool=$(json_tool) || { rm -f "$tmp"; return 2; }
+    
+    if [ "$tool" = "jq" ]; then
+        if jq --arg p "$pkg" '.dsh.profile.bundles |= map(select(. != $p))' "$file" > "$tmp" 2>/dev/null \
+            && [ -s "$tmp" ] && mv "$tmp" "$file" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$tmp"
+        return 1
+    fi
+    
+    # python3 兜底
+    if python3 -c '
+import json, sys
+src, dst, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src, encoding="utf-8") as f:
+    data = json.load(f)
+bundles = data.get("dsh", {}).get("profile", {}).get("bundles")
+if isinstance(bundles, list):
+    data["dsh"]["profile"]["bundles"] = [x for x in bundles if x != pkg]
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+' "$file" "$tmp" "$pkg" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$file" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # 插件管理（整合所有插件功能）
+# 包装层：内部需要 cd 到 profile 目录，若不恢复工作目录，
+# 返回主菜单后所有依赖 $0 相对路径的功能（改名写回、加别名、
+# 菜单 00 自更新）都会找不到脚本文件。
 plugin_management() {
+    local _saved_pwd="$PWD"
+    plugin_menu_loop
+    local _rc=$?
+    cd "$_saved_pwd" 2>/dev/null || cd "$HOME" 2>/dev/null
+    return $_rc
+}
+
+plugin_menu_loop() {
     title "插件管理"
     
     local profile=$(get_current_profile)
@@ -1696,7 +1821,7 @@ plugin_management() {
             echo "1. 安装插件"
             echo "0. 返回"
             echo
-            read -r -p "请选择操作： " choice
+            read -r -p "请选择操作： " choice || { echo; return 0; }
             
             case $choice in
                 1)
@@ -1746,7 +1871,7 @@ plugin_management() {
                 if [ -n "$plugin" ]; then
                     plugins+=("$plugin")
                     # 检查插件状态（检查是否在 node_modules 中存在）
-                    local plugin_name=$(echo "$plugin" | cut -d'@' -f1)
+                    local plugin_name=$(plugin_name_of "$plugin")
                     local status="✅ 已启用"
                     if [ ! -d "node_modules/$plugin_name" ]; then
                         status="❌ 已禁用"
@@ -1764,7 +1889,7 @@ plugin_management() {
             echo "4. 删除插件（支持批量）"
             echo "0. 返回"
             echo
-            read -r -p "请选择操作： " choice
+            read -r -p "请选择操作： " choice || { echo; return 0; }
             
             case $choice in
                 1)
@@ -1802,7 +1927,7 @@ plugin_management() {
                     read -r plugin_num
                     if [[ "$plugin_num" =~ ^[0-9]+$ ]] && [ "$plugin_num" -ge 1 ] && [ "$plugin_num" -le ${#plugins[@]} ]; then
                         local plugin_name="${plugins[$((plugin_num-1))]}"
-                        local plugin_short_name=$(echo "$plugin_name" | cut -d'@' -f1)
+                        local plugin_short_name=$(plugin_name_of "$plugin_name")
                         echo "启用插件：$plugin_short_name"
                         
                         # 检查是否被禁用（重命名了）
@@ -1829,7 +1954,7 @@ plugin_management() {
                     read -r plugin_num
                     if [[ "$plugin_num" =~ ^[0-9]+$ ]] && [ "$plugin_num" -ge 1 ] && [ "$plugin_num" -le ${#plugins[@]} ]; then
                         local plugin_name="${plugins[$((plugin_num-1))]}"
-                        local plugin_short_name=$(echo "$plugin_name" | cut -d'@' -f1)
+                        local plugin_short_name=$(plugin_name_of "$plugin_name")
                         echo "禁用插件：$plugin_short_name"
                         
                         # 检查是否已启用
@@ -1865,7 +1990,7 @@ plugin_management() {
                     for num in $plugin_nums; do
                         if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le ${#plugins[@]} ]; then
                             local plugin_name="${plugins[$((num-1))]}"
-                            local plugin_short_name=$(echo "$plugin_name" | sed 's/@[^@]*$//')
+                            local plugin_short_name=$(plugin_name_of "$plugin_name")
                             if [ -z "$plugin_short_name" ]; then
                                 plugin_short_name="$plugin_name"
                             fi
@@ -1886,19 +2011,36 @@ plugin_management() {
                     read -r CONFIRM
                     
                     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+                        # 先确认有 JSON 编辑工具。没有工具就绝不能动插件：
+                        # pnpm remove 会清掉 dependencies，而 bundles 改不了，
+                        # 结果是 DSH 启动时报 cannot resolve profile bundle。
+                        if ! json_tool >/dev/null 2>&1; then
+                            err "缺少 jq 或 python3，无法安全删除插件"
+                            echo "  删除插件必须同步更新 package.json 的 bundles，"
+                            echo "  否则 DSH 下次启动会报 cannot resolve profile bundle。"
+                            echo "  请先安装其一后重试："
+                            echo "    apt install -y jq        # Debian/Ubuntu"
+                            echo "    dnf install -y jq        # Fedora/RHEL"
+                            continue
+                        fi
+                        
                         local success_count=0
                         local fail_count=0
                         
                         for plugin_short_name in "${delete_list[@]}"; do
                             echo "删除插件：$plugin_short_name"
-                            pnpm remove "$plugin_short_name" 2>/dev/null
-                            if [ $? -eq 0 ]; then
-                                # 从 bundles 中移除
-                                local temp_file=$(mktemp)
-                                jq --arg pkg "$plugin_short_name" '.dsh.profile.bundles |= map(select(. != $pkg))' package.json > "$temp_file" && mv "$temp_file" package.json 2>/dev/null
+                            if ! pnpm remove "$plugin_short_name" >/dev/null 2>&1; then
+                                warn "删除失败：$plugin_short_name"
+                                fail_count=$((fail_count + 1))
+                                continue
+                            fi
+                            # 依赖已移除，务必确认 bundles 也摘掉了
+                            if remove_from_bundles "$plugin_short_name"; then
                                 success_count=$((success_count + 1))
                             else
-                                warn "删除失败：$plugin_short_name"
+                                warn "已从依赖移除，但未能更新 dsh.profile.bundles：$plugin_short_name"
+                                echo "  这会导致 DSH 启动报 cannot resolve profile bundle，请手动处理："
+                                echo "  编辑 package.json，把 bundles 里的 \"$plugin_short_name\" 删掉"
                                 fail_count=$((fail_count + 1))
                             fi
                         done
@@ -1926,7 +2068,7 @@ plugin_management() {
         
         echo
         printf "按回车继续..."
-        read -r null
+        read -r null || { echo; return 0; }
     done
 }
 
@@ -1973,36 +2115,29 @@ check_session_integrity() {
 }
 
 # 修复损坏的会话文件
-fix_corrupted_session() {
+# 注意：DSH 会话日志是压缩的追加式日志，损坏后无法在本脚本内安全重建。
+# 原实现是"把损坏文件复制成 .backup，再从这个副本恢复回自身"，
+# 副本内容与原文件完全相同，于是必然"校验通过"并报告修复成功 ——
+# 实际一个字节都没修，还会在每个会话目录留下 .backup 垃圾。
+# 改成如实报告并给出可行路径，不再谎报修复。
+report_corrupted_session() {
     local session_dir="$1"
     local session_file="$session_dir/session.v3.jsonl.zstd"
     
-    echo "尝试修复会话：$(basename "$session_dir")"
-    
-    # 备份原始文件
-    local backup_file="$session_dir/session.v3.jsonl.zstd.backup"
-    if [ -f "$session_file" ]; then
-        cp "$session_file" "$backup_file" 2>/dev/null
+    echo "  ❌ 会话损坏：$(basename "$session_dir")"
+    echo "     文件：$session_file"
+    if [ -s "$session_file" ]; then
+        echo "     大小：$(stat -c%s "$session_file" 2>/dev/null) 字节"
     fi
-    
-    # 检查是否有备份文件
-    if [ -f "$backup_file" ]; then
-        # 尝试从备份恢复
-        if check_session_integrity "$backup_file"; then
-            cp "$backup_file" "$session_file" 2>/dev/null
-            info "已从备份恢复会话文件"
-            return 0
-        fi
-    fi
-    
-    # 如果备份也损坏，尝试重建会话
-    warn "会话文件无法修复，建议重新创建会话"
+    echo "     可选处理："
+    echo "       1) 有正常时期的备份 → 菜单 13「恢复对话记录」"
+    echo "       2) 否则该会话无法恢复，可删除该会话目录后重新开始"
     return 1
 }
 
-# 扫描并修复会话文件
+# 扫描会话文件（检测完整性，损坏时如实报告）
 scan_and_fix_sessions() {
-    title "扫描并修复会话文件"
+    title "扫描会话文件"
     
     local sessions_dir="$HOME/.dsh/sessions"
     
@@ -2018,7 +2153,6 @@ scan_and_fix_sessions() {
     # 统计会话文件
     local total_sessions=0
     local corrupted_sessions=0
-    local fixed_sessions=0
     
     echo "正在扫描会话文件..."
     echo
@@ -2041,10 +2175,8 @@ scan_and_fix_sessions() {
                         if ! check_session_integrity "$session_file"; then
                             corrupted_sessions=$((corrupted_sessions + 1))
                             
-                            # 尝试修复
-                            if fix_corrupted_session "$session_dir"; then
-                                fixed_sessions=$((fixed_sessions + 1))
-                            fi
+                            # 损坏时如实报告（不做假修复：这类压缩日志无法在脚本内安全重建）
+                            report_corrupted_session "$session_dir"
                         fi
                     fi
                 fi
@@ -2057,25 +2189,23 @@ scan_and_fix_sessions() {
     title "扫描结果"
     echo "总会话数：$total_sessions"
     echo "损坏会话数：$corrupted_sessions"
-    echo "修复成功数：$fixed_sessions"
     echo
     
     if [ $corrupted_sessions -gt 0 ]; then
-        if [ $fixed_sessions -eq $corrupted_sessions ]; then
-            info "所有损坏的会话已修复"
-        else
-            warn "部分会话无法修复，建议："
-            echo "1. 检查备份文件是否完整"
-            echo "2. 在恢复前停止 DSH 服务"
-            echo "3. 重新创建损坏的会话"
-        fi
+        warn "共发现 $corrupted_sessions 个损坏会话"
+        echo "这类日志是压缩的追加式文件，损坏后无法在本脚本内安全重建。"
+        echo "建议："
+        echo "  1. 有正常时期的备份 → 菜单 13「恢复对话记录」"
+        echo "  2. 确认 DSH 已停止后再操作，避免写入中的文件被复制"
+        echo "  3. 无法恢复的会话，可删除其会话目录后重新开始"
     else
         info "没有发现损坏的会话文件"
     fi
     
     echo
-    echo "提示：修复后请重启 DSH 服务"
-    echo "  systemctl restart $SVC"
+    echo "提示：本功能只检测、不修改任何会话文件。"
+    echo "如需从备份恢复，请用菜单 13；操作前建议先停止服务："
+    echo "  systemctl stop $SVC"
 }
 
 # ========== 添加快捷命令到 .bashrc ==========
@@ -2083,8 +2213,10 @@ add_alias_to_bashrc() {
     title "添加快捷命令到 .bashrc"
     
     local BASHRC="$HOME/.bashrc"
-    local ALIAS_LINE="alias d='bash $(realpath "$0")'"
-    local ALIAS_COMMENT="# DSH-Web 管理脚本快捷命令"
+    local SELF_PATH
+    SELF_PATH=$(get_self_path)
+    local ALIAS_LINE="alias d='bash $SELF_PATH'"
+    local ALIAS_COMMENT="# DSH 管理脚本快捷命令"
     
     # 检查 .bashrc 文件是否存在
     if [ ! -f "$BASHRC" ]; then
@@ -2092,16 +2224,28 @@ add_alias_to_bashrc() {
         return 1
     fi
     
-    # 检查是否已存在别名
-    if grep -q "alias d='bash.*dsh.sh'" "$BASHRC" 2>/dev/null; then
-        warn "快捷命令已存在于 .bashrc 中"
+    # 判据用"将要写入的完整行"做字面匹配。
+    # 原先用 grep "alias d='bash.*dsh.sh'" 判断，但安装后的路径是
+    # /usr/local/bin/dsh-manager，永远匹配不到，于是每按一次就重复追加一组。
+    if grep -qF "$ALIAS_LINE" "$BASHRC" 2>/dev/null; then
+        warn "快捷命令已存在于 .bashrc 中（指向同一路径）"
+        return 0
+    fi
+    
+    # 已有 d 别名（无论指向何处）时不要静默重复追加，否则会互相覆盖
+    if grep -qE "^alias[[:space:]]+d=" "$BASHRC" 2>/dev/null; then
+        warn ".bashrc 中已存在 d 别名，未重复添加"
+        echo "  现有定义：$(grep -E '^alias[[:space:]]+d=' "$BASHRC" | head -n 1)"
+        echo "  如需改用本脚本，请先用菜单 11 移除，或手动删除该行"
         return 0
     fi
     
     # 添加别名到 .bashrc
-    echo "" >> "$BASHRC"
-    echo "$ALIAS_COMMENT" >> "$BASHRC"
-    echo "$ALIAS_LINE" >> "$BASHRC"
+    {
+        echo ""
+        echo "$ALIAS_COMMENT"
+        echo "$ALIAS_LINE"
+    } >> "$BASHRC"
     
     if [ $? -eq 0 ]; then
         info "快捷命令已添加到 .bashrc"
@@ -2123,6 +2267,8 @@ remove_alias_from_bashrc() {
     title "移除快捷命令从 .bashrc"
     
     local BASHRC="$HOME/.bashrc"
+    local SELF_PATH
+    SELF_PATH=$(get_self_path)
     
     # 检查 .bashrc 文件是否存在
     if [ ! -f "$BASHRC" ]; then
@@ -2130,26 +2276,38 @@ remove_alias_from_bashrc() {
         return 1
     fi
     
-    # 检查是否存在别名
-    if ! grep -q "alias d='bash.*dsh.sh'" "$BASHRC" 2>/dev/null; then
+    # 匹配本脚本可能写入的两种形态：
+    #   1) alias d='bash <本脚本绝对路径>'   （本菜单写入）
+    #   2) alias d='dsh-manager'             （安装器写入）
+    # 原先只匹配 dsh.sh 字样，安装成 dsh-manager 后永远删不掉。
+    local found=0
+    if grep -qF "alias d='bash $SELF_PATH'" "$BASHRC" 2>/dev/null; then
+        found=1
+    elif grep -qF "alias d='$TARGET_NAME'" "$BASHRC" 2>/dev/null; then
+        found=1
+    elif grep -qE "^alias[[:space:]]+d=" "$BASHRC" 2>/dev/null; then
+        found=1
+    fi
+    
+    if [ $found -eq 0 ]; then
         warn "未找到 DSH 快捷命令"
         return 0
     fi
     
-    # 移除别名和注释
-    sed -i '/# DSH-Web 管理脚本快捷命令/d' "$BASHRC"
-    sed -i "/alias d='bash.*dsh.sh'/d" "$BASHRC"
+    # 只删本脚本写入的那几行；不碰用户自己定义的其他 d 别名以外内容
+    sed -i '/^# DSH 管理脚本快捷命令$/d' "$BASHRC"
+    sed -i '/^# DSH-Web 管理脚本快捷命令$/d' "$BASHRC"
+    sed -i "/^alias d='bash .*'$/d" "$BASHRC"
+    sed -i "/^alias d='$TARGET_NAME'$/d" "$BASHRC"
     
-    if [ $? -eq 0 ]; then
-        info "快捷命令已从 .bashrc 移除"
-        echo
-        echo "提示：需要重新加载 .bashrc 才能生效："
-        echo "  source ~/.bashrc"
-        echo "  或重新登录终端"
-    else
-        err "移除快捷命令失败"
-        return 1
-    fi
+    # 清掉可能残留的尾部空行
+    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$BASHRC" 2>/dev/null
+    
+    info "快捷命令已从 .bashrc 移除"
+    echo
+    echo "提示：需要重新加载 .bashrc 才能生效："
+    echo "  source ~/.bashrc"
+    echo "  或重新登录终端"
 }
 
 # ========== 菜单 ==========
@@ -2208,7 +2366,7 @@ menu() {
     echo "14. 插件管理"
     echo
     echo "=== 会话维护 ==="
-    echo "15. 扫描并修复会话文件"
+    echo "15. 扫描会话文件"
     echo
     echo "00. 更新管理脚本"
     echo
