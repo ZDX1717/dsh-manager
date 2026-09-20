@@ -246,17 +246,36 @@ get_self_path() {
 # ========== 更新源列表与下载（带超时与备用源） ==========
 # raw.githubusercontent.com 在国内经常被干扰，卡住/超时是常见现象，
 # 因此按顺序尝试多个源，任一成功即返回。
+# jsDelivr 对 @分支 的缓存可能长达 12 小时（会静默返回旧版本），
+# 所以优先用 commit SHA 寻址，保证拿到最新内容。
+resolve_commit_sha() {
+    local owner="$1" repo="$2" ref="$3"
+    curl -fsSL \
+        --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
+        --max-time "$SCRIPT_MAX_TIME" \
+        "https://api.github.com/repos/$owner/$repo/commits/$ref" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+        | head -n 1
+}
+
 script_update_urls() {
+    # 主源：raw（5 分钟缓存，最权威）
     printf '%s\n' "$SCRIPT_RAW_URL"
     
-    # 由 raw 地址推导 jsDelivr 等价地址（公开 CDN，回源 GitHub 仓库）
+    # 由 raw 地址推导 jsDelivr 等价地址
     case "$SCRIPT_RAW_URL" in
         *raw.githubusercontent.com/*/*/*/*)
             local rest="${SCRIPT_RAW_URL#*raw.githubusercontent.com/}"
             local owner="${rest%%/*}"; rest="${rest#*/}"
             local repo="${rest%%/*}";  rest="${rest#*/}"
-            local ref="${rest%%/*}";   rest="${rest#*/}"
-            printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$ref/$rest"
+            local ref="${rest%%/*}";   local file="${rest#*/}"
+            local sha
+            sha="$(resolve_commit_sha "$owner" "$repo" "$ref" || true)"
+            if [ -n "$sha" ]; then
+                printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$sha/$file"
+            fi
+            # 兜底：SHA 解析失败时用分支名（可能滞后）
+            printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$ref/$file"
             ;;
     esac
     

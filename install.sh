@@ -44,22 +44,41 @@ PAYLOAD_TMP=""
 
 # 备用下载源。raw.githubusercontent.com 在国内经常被干扰，
 # 卡住或超时是常见现象，因此依次尝试。
-# jsDelivr 是公开 CDN，直接回源 GitHub 仓库内容；
+# jsDelivr 是公开 CDN，直接回源 GitHub 仓库内容；但它对 @分支 的缓存
+# 可能长达 12 小时，会静默返回旧版本，所以这里优先用 commit SHA 寻址
+# （SHA 对应的内容是immutable的，永远是最新且一致）。
 # 可用 DSH_EXTRA_MIRRORS 追加自定义镜像（空格分隔的 URL 前缀）。
+resolve_commit_sha() {
+    local owner="$1" repo="$2" ref="$3"
+    curl -fsSL \
+        --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+        --max-time "$CURL_MAX_TIME" \
+        "https://api.github.com/repos/$owner/$repo/commits/$ref" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+        | head -n 1
+}
+
 download_urls() {
     local rel="$1"
+    # 主源：raw（5 分钟缓存，最权威）
     printf '%s\n' "$RAW_BASE/$rel"
+
     case "$RAW_BASE" in
         *raw.githubusercontent.com/*)
-            # 从 RAW_BASE 解析出 owner/repo@ref，构造 jsDelivr 地址
             local path="${RAW_BASE#*raw.githubusercontent.com/}"
-            local owner="${path%%/*}"
-            path="${path#*/}"
+            local owner="${path%%/*}"; path="${path#*/}"
             local repo="${path%%/*}"
             local ref="${path#*/}"
+            local sha
+            sha="$(resolve_commit_sha "$owner" "$repo" "$ref" || true)"
+            if [ -n "$sha" ]; then
+                printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$sha/$rel"
+            fi
+            # 兜底：SHA 解析失败时用分支名（可能滞后，但聊胜于无）
             printf '%s\n' "https://cdn.jsdelivr.net/gh/$owner/$repo@$ref/$rel"
             ;;
     esac
+
     local m
     for m in ${DSH_EXTRA_MIRRORS:-}; do
         printf '%s\n' "${m%/}/$rel"
