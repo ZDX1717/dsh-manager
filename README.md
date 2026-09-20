@@ -5,21 +5,43 @@ DSH-Web 服务管理脚本。基于 systemd 管理 DSH 服务，并提供插件�
 ## 一键安装
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh -o /tmp/dsh_install.sh && sudo bash /tmp/dsh_install.sh
+bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh)
 ```
 
-也支持管道方式（脚本会自动从 `/dev/tty` 读取确认）：
+**不需要加 `sudo`**——安装器会自己检测权限，非 root 时自动提权。
+
+其他等价写法（都已实测）：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh | sudo bash
+# 管道
+curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh | bash
+
+# 先下载再执行（最稳妥）
+curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh -o /tmp/i.sh && bash /tmp/i.sh
+
+# 已在 root 下
+sudo bash -c "$(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh)"
 ```
 
-> ⚠️ 不要用 `sudo bash <(curl -sSL ...)`。
-> `sudo` 下 `/dev/fd/63` 不可访问，会报
-> `bash: /dev/fd/63: No such file or directory` 和 `curl: (23) Failure writing output to destination`。
-> 这是进程替换与 sudo 的兼容问题，不是脚本本身的问题。
+安装器选项：
 
-安装完成后可直接使用快捷命令 `d` 打开管理面板。
+| 选项 | 说明 |
+|------|------|
+| `-y`, `--yes` | 跳过确认，直接安装（适合脚本化） |
+| `--from-file PATH` | 使用本地 `dsh.sh` 安装（离线安装） |
+| `-h`, `--help` | 显示帮助 |
+
+> ⚠️ **不要写成 `sudo bash <(curl -sSL ...)`**
+> `<( )` 传的是路径 `/dev/fd/63`，而 `/dev/fd` 指向 `/proc/self/fd`，是**进程私有**的句柄；
+> 同时 sudo 默认会关闭 3 及以上的 fd。root 的 bash 打不开该路径就直接退出，
+> 脚本一个字节都不会执行，于是连带 curl 报错：
+> `bash: /dev/fd/63: No such file or directory` + `curl: (23) Failure writing output to destination`。
+> 这是调用写法问题，脚本内部无法补救 —— 去掉 `sudo` 即可（安装器会自己提权）。
+
+> 📌 推送后 `raw.githubusercontent.com` 有 **5 分钟 CDN 缓存**（`cache-control: max-age=300`）。
+> 刚更新完脚本若取到旧内容，等几分钟或改用 API 地址即可。
+
+安装完成后重新登录（或 `source ~/.bashrc`），即可用快捷命令 `d` 打开管理面板。
 
 ## 手动安装
 
@@ -132,6 +154,14 @@ sed -i "/alias d='dsh-manager'/d" ~/.bashrc
 ```
 
 ## 更新管理脚本
+
+最简单的方式是重跑一次安装器（会覆盖旧版本）：
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/install_dsh_manager.sh) -y
+```
+
+或手动替换：
 
 ```bash
 sudo curl -sSL https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh -o /usr/local/bin/dsh-manager

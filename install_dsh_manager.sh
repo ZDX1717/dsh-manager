@@ -125,6 +125,8 @@ ensure_root() {
     warn "当前用户 $(id -un) 非 root，提权后继续"
     local tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/dsh-installer.XXXXXX")"
+    # 立刻登记，保证后面任何分支提前退出时都会被 EXIT trap 清理
+    ELEVATED_TMP="$tmp"
 
     # 以文件方式调用时直接复制自身，省一次下载；
     # 进程替换 / 管道调用时 $0 不是普通文件，改为重新下载。
@@ -140,9 +142,6 @@ ensure_root() {
         exit 1
     fi
     chmod +x "$tmp"
-
-    # 交给父进程的 EXIT trap 清理，提权失败也不会留下临时文件
-    ELEVATED_TMP="$tmp"
 
     local rc=0
     if [ "$ASSUME_YES" -eq 1 ]; then
@@ -181,9 +180,10 @@ check_deps() {
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
     done
     if [ -n "$missing" ]; then
+        missing="${missing# }"
         warn "可选依赖未安装：$missing"
         echo "  jq=插件配置管理  rsync=更稳的备份/恢复  zstd=会话文件校验"
-        echo "  安装示例：apt install -y$missing"
+        echo "  安装示例：apt install -y $missing"
     fi
 }
 
@@ -289,8 +289,8 @@ done_info() {
     echo
     echo "首次使用建议先执行菜单里的「初次初始化 Systemd 服务」。"
     echo
-    echo "更新主脚本："
-    echo "  bash <(curl -sSL $RAW_BASE/$PAYLOAD_NAME)   # 或重跑本安装器"
+    echo "更新："
+    echo "  bash <(curl -sSL $SELF_URL) -y   # 重跑本安装器即可覆盖升级"
     echo
     echo "卸载："
     echo "  sudo rm -f $TARGET_BIN /usr/bin/$TARGET_NAME $PROFILE_FILE"
