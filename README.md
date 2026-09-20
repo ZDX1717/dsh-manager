@@ -72,7 +72,7 @@ DSH_EXTRA_MIRRORS=https://your-mirror/prefix bash <(curl -sSL .../install.sh)
 === 安装与配置 ===
 7. 初次初始化 Systemd 服务
 8. 修改 systemd 服务名称
-9. 卸载 systemd 服务
+9. 卸载（服务/程序/管理脚本）
 10. 添加快捷命令到 .bashrc
 11. 移除快捷命令从 .bashrc
 12. 安装/更新 DSH 程序本体(npm)

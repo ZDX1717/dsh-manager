@@ -20,8 +20,10 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 TARGET_NAME="dsh-manager"
+# 安装器写入的系统级快捷命令片段（卸载时会清理）
+PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
 SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh}"
 # 下载超时：故意设得较短——有备用源兜底，宁可快速失败切换
 SCRIPT_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
@@ -869,6 +871,228 @@ uninstall_svc() {
     fi
     sysctl daemon-reload
     info "✅ systemd服务已卸载，dsh二进制文件保留"
+}
+
+# ========== 卸载：DSH 程序本体（npm） ==========
+uninstall_dsh() {
+    title "卸载 DSH 程序本体"
+    
+    if ! command -v npm >/dev/null 2>&1; then
+        err "未找到 npm，无法通过 npm 卸载"
+        echo "若当初是用其它方式装的（如手动放二进制），请自行删除："
+        echo "  $DSH_BIN"
+        return 1
+    fi
+    
+    if ! check_dsh_installed; then
+        warn "未检测到已安装的 DSH，无需卸载"
+        return 0
+    fi
+    
+    echo "当前版本：$(get_dsh_version)"
+    echo "安装位置：$(command -v dsh 2>/dev/null || echo "$DSH_BIN")"
+    echo
+    info "说明：卸载程序本体不会删除你的数据"
+    echo "  会话与配置仍在：$HOME/.dsh"
+    echo "  如需保留，建议先用菜单 13「备份与恢复管理」导出"
+    echo
+    
+    local CONFIRM
+    read -r -p "确认卸载 DSH 程序本体？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "操作已取消"
+        return 0
+    fi
+    
+    # 服务还在跑就先停掉，避免留下仍占用端口的僵尸进程
+    if is_run; then
+        echo
+        echo "检测到服务正在运行，先停止..."
+        sysctl stop "$SVC" >/dev/null 2>&1
+        sleep 1
+        if is_run; then
+            warn "服务停止失败，请稍后手动检查：systemctl status $SVC"
+        else
+            echo "服务已停止"
+        fi
+    fi
+    
+    # 与安装一致：按 npm 全局前缀是否可写决定要不要 sudo
+    local npm_prefix="" npm_need_sudo=0
+    npm_prefix=$(npm prefix -g 2>/dev/null)
+    if [ "$(id -u)" -ne 0 ]; then
+        if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
+            npm_need_sudo=0
+        else
+            npm_need_sudo=1
+        fi
+    fi
+    
+    echo
+    echo "正在卸载 DSH 程序本体..."
+    local ret=0
+    if [ "$npm_need_sudo" -eq 1 ]; then
+        sudo npm uninstall -g @deepseek-ai/dsh 2>&1 || ret=$?
+    else
+        npm uninstall -g @deepseek-ai/dsh 2>&1 || ret=$?
+    fi
+    
+    if [ $ret -ne 0 ]; then
+        err "npm 卸载失败"
+        echo "可手动执行："
+        if [ "$npm_need_sudo" -eq 1 ]; then
+            echo "  sudo npm uninstall -g @deepseek-ai/dsh"
+        else
+            echo "  npm uninstall -g @deepseek-ai/dsh"
+        fi
+        return 1
+    fi
+    
+    hash -r 2>/dev/null || true
+    
+    # 校验结果：可能还有别的副本（例如手动放的二进制）残留
+    if check_dsh_installed; then
+        warn "卸载命令已执行，但仍能检测到 dsh"
+        echo "  位置：$(command -v dsh 2>/dev/null || echo "$DSH_BIN")"
+        echo "  这通常是另一处副本（手动安装 / 别的 Node 环境），请自行确认后删除"
+        return 1
+    fi
+    
+    info "DSH 程序本体已卸载"
+    echo "数据目录未改动：$HOME/.dsh"
+}
+
+# 从某个 rc 文件里摘掉本脚本写入的快捷别名
+strip_alias_lines() {
+    local rc="$1"
+    [ -f "$rc" ] || return 0
+    sed -i '/^# DSH 管理脚本快捷命令$/d' "$rc" 2>/dev/null
+    sed -i '/^# DSH-Web 管理脚本快捷命令$/d' "$rc" 2>/dev/null
+    sed -i "/^alias d='bash .*'$/d" "$rc" 2>/dev/null
+    sed -i "/^alias d='$TARGET_NAME'$/d" "$rc" 2>/dev/null
+    return 0
+}
+
+# ========== 卸载：本管理脚本自身 ==========
+uninstall_self() {
+    title "卸载本管理脚本"
+    
+    local SELF
+    SELF=$(get_self_path)
+    if [ ! -f "$SELF" ]; then
+        err "无法定位本脚本文件（当前以 $0 运行）"
+        return 1
+    fi
+    
+    echo "将删除以下内容："
+    echo "  · 管理脚本本体：$SELF"
+    [ -L "/usr/bin/$TARGET_NAME" ] && echo "  · 软链接：/usr/bin/$TARGET_NAME"
+    [ -f "$PROFILE_FILE" ] && echo "  · 快捷命令：$PROFILE_FILE"
+    echo "  · ~/.bashrc 中的 alias d=..."
+    echo
+    info "不会删除：DSH 程序本体、$HOME/.dsh 数据"
+    echo
+    
+    local CONFIRM
+    read -r -p "确认卸载管理脚本？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "操作已取消"
+        return 0
+    fi
+    
+    local rm_sh
+    if [ "$(id -u)" -eq 0 ]; then
+        rm_sh="rm -f"
+    else
+        rm_sh="sudo rm -f"
+    fi
+    
+    # 软链与 profile 片段
+    [ -L "/usr/bin/$TARGET_NAME" ] && { $rm_sh "/usr/bin/$TARGET_NAME" 2>/dev/null; echo "已删除 /usr/bin/$TARGET_NAME"; }
+    [ -f "$PROFILE_FILE" ] && { $rm_sh "$PROFILE_FILE" 2>/dev/null; echo "已删除 $PROFILE_FILE"; }
+    
+    # ~/.bashrc 中的别名（含调用者用户，避免只清 root 的）
+    local login_user="${SUDO_USER:-$(id -un)}"
+    local home
+    home="$(getent passwd "$login_user" 2>/dev/null | cut -d: -f6 || true)"
+    if [ -n "$home" ] && [ -f "$home/.bashrc" ]; then
+        strip_alias_lines "$home/.bashrc"
+        echo "已清理 $home/.bashrc 中的快捷别名"
+    fi
+    [ -f "$HOME/.bashrc" ] && [ "$HOME/.bashrc" != "$home/.bashrc" ] && strip_alias_lines "$HOME/.bashrc"
+    
+    # 最后删自身。删掉后当前进程仍在内存中运行，属正常。
+    if ! $rm_sh "$SELF" 2>/dev/null; then
+        err "无法删除 $SELF，请手动执行："
+        echo "  $rm_sh $SELF"
+        return 1
+    fi
+    
+    echo
+    info "管理脚本已卸载"
+    echo "当前会话仍在运行，退出后即彻底移除。"
+    echo "如已开启 shell 缓存，请执行：hash -r  或重新登录"
+    return 0
+}
+
+# ========== 卸载管理（子菜单） ==========
+uninstall_management() {
+    while true; do
+        clear 2>/dev/null
+        echo "=== 卸载 ==="
+        echo
+        echo "1. 卸载 systemd 服务（保留 DSH 程序与管理脚本）"
+        echo "2. 卸载 DSH 程序本体（npm，保留数据）"
+        echo "3. 完全卸载（服务 + DSH 程序 + 管理脚本，保留数据）"
+        echo "0. 返回"
+        echo
+        read -r -p "请选择： " choice || { echo; return 0; }
+        
+        case "$choice" in
+            1)
+                uninstall_svc
+                ;;
+            2)
+                uninstall_dsh
+                ;;
+            3)
+                echo
+                warn "完全卸载将依次执行："
+                echo "  1) 停止并删除 systemd 服务"
+                echo "  2) 卸载 DSH 程序本体"
+                echo "  3) 删除管理脚本及其快捷命令"
+                echo
+                info "数据目录 $HOME/.dsh 会保留"
+                echo
+                local CONFIRM
+                read -r -p "确认完全卸载？(y/N): " CONFIRM || CONFIRM=""
+                if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+                    warn "操作已取消"
+                else
+                    echo
+                    uninstall_svc
+                    echo
+                    uninstall_dsh
+                    echo
+                    # 只有删成功才结束进程；失败就留在菜单里，
+                    # 否则用户看不到"无法删除"的提示与手动处理办法
+                    if uninstall_self; then
+                        exit 0
+                    fi
+                fi
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                err "无效的选择"
+                ;;
+        esac
+        
+        echo
+        printf "按回车继续..."
+        read -r null || { echo; return 0; }
+    done
 }
 
 # ========== 实时日志 ==========
@@ -2416,7 +2640,7 @@ menu() {
     echo "=== 安装与配置 ==="
     echo "7. 初次初始化 Systemd 服务"
     echo "8. 修改 systemd 服务名称"
-    echo "9. 卸载 systemd 服务"
+    echo "9. 卸载（服务/程序/管理脚本）"
     echo "10. 添加快捷命令到 .bashrc"
     echo "11. 移除快捷命令从 .bashrc"
     echo "12. 安装/更新 DSH 程序本体(npm)"
@@ -2459,7 +2683,7 @@ while true; do
         6) show_logs ;;
         7) init_systemd ;;
         8) rename_svc ;;
-        9) uninstall_svc ;;
+        9) uninstall_management ;;
         10) add_alias_to_bashrc ;;
         11) remove_alias_from_bashrc ;;
         12) install_or_update_dsh ;;
