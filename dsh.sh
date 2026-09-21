@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -734,25 +734,66 @@ status_svc() {
     fi
 }
 
-# ========== 获取访问链接（仅本地链接，移除公网IP相关逻辑） ==========
+# ========== 获取访问链接 ==========
 get_url() {
     if ! is_run; then
         err "服务未运行，无法获取链接"
         return 1
     fi
 
+    title "带 Token 访问链接"
+
+    # 只认「本次运行的主进程」输出的那一行。
+    # 否则服务刚重启、新 token 还没打印时，日志里最后一次匹配到的
+    # 是上一次运行的旧 token，会拿着一个已失效的链接告诉用户可用。
+    local PID=""
+    PID=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+
+    local JC
     if [ "$(id -u)" -eq 0 ]; then
-        LINK=$(journalctl -u "$SVC" --no-pager | grep -oE 'http://127\.0\.0\.1:'"$DSH_PORT"'/\?token=[0-9a-zA-Z_-]+' | tail -1)
+        JC="journalctl"
     else
-        LINK=$(sudo journalctl -u "$SVC" --no-pager | grep -oE 'http://127\.0\.0\.1:'"$DSH_PORT"'/\?token=[0-9a-zA-Z_-]+' | tail -1)
+        JC="sudo journalctl"
     fi
 
-    title "带 Token 访问链接"
+    # 不硬编码 host:port —— 用户可能改过 systemd 单元里的监听地址
+    local PATTERN='https?://[^[:space:]]*token=[0-9A-Za-z_-]+'
+
+    echo "正在从服务日志读取 token（DSH 启动后约需 10~15 秒才打印）..."
+    echo
+
+    local LINK=""
+    local i=0
+    while [ $i -lt 60 ]; do
+        if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+            LINK=$($JC -u "$SVC" --no-pager _PID="$PID" 2>/dev/null | grep -oE "$PATTERN" | tail -1)
+        fi
+        [ -n "$LINK" ] && break
+        printf "."
+        sleep 1
+        i=$((i+1))
+    done
+    printf "\n"
+
     if [ -n "$LINK" ]; then
         printf "${GRN}${BLD}%s${RST}\n" "$LINK"
-    else
-        warn "暂未抓取到 Token（刚启动请等待2秒重试）"
+        echo
+        echo "本次运行的主进程 PID：${PID:-未知}"
+        echo "提示：token 每次重启都会变化，请以本条为准。"
+        return 0
     fi
+
+    warn "未能从日志中读到本次运行的 token"
+    echo
+    echo "已等待 ${i} 秒。可能原因："
+    echo "  · 服务刚启动，token 尚未打印（再选一次本项即可）"
+    echo "  · 当前主进程 PID 为 ${PID:-未知}，日志里没有它的启动输出"
+    echo "    （例如服务启动很久、日志已轮转）"
+    echo
+    echo "可尝试："
+    echo "  1) 重启服务后立即选本项：systemctl restart $SVC"
+    echo "  2) 直接查看日志确认：journalctl -u $SVC -n 50 --no-pager"
+    return 1
 }
 
 # ========== 修改服务名 ==========
