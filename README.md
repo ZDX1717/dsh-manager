@@ -38,14 +38,28 @@ bash <(curl -sSL https://cdn.jsdelivr.net/gh/ZDX1717/dsh-manager@main/install.sh
 下载时**会自动按顺序切换源**，每个源都有限时（连接 8s / 总计 30s），不会一直卡住：
 
 ```
-raw.githubusercontent.com  →  <owner>.github.io  →  cdn.jsdelivr.net@<commit SHA>  →  cdn.jsdelivr.net@main  →  自定义镜像
+raw.githubusercontent.com  →  <owner>.github.io  →  cdn.jsdelivr.net@<commit SHA>
+  →  cdn.jsdelivr.net@main  →  自建镜像 github.zdx1717.ccwu.cc  →  自定义镜像
 ```
+
+自建镜像排在内置源末尾：多数网络根本走不到它，只有前面全不通时才启用；
+即使内容被篡改，也会被 SHA-256 门禁拦下，不会装入未知内容。
 
 CDN 源用 commit SHA 寻址，保证拿到的是最新内容（jsDelivr 对分支的缓存可能滞后 12 小时）。也可用环境变量指定自己的镜像：
 
 ```bash
 DSH_EXTRA_MIRRORS=https://your-mirror/prefix bash <(curl -sSL .../install.sh)
 ```
+
+国内网络下可直接把自建镜像提为主源（最快）：
+
+```bash
+DSH_RAW_BASE=https://github.zdx1717.ccwu.cc/raw/ZDX1717/dsh-manager/main \
+DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
+  bash install.sh
+```
+
+`DSH_GITHUB_API` 只影响 commit SHA 的解析；若网络屏蔽 `api.github.com`，用它指向自建镜像即可恢复 jsDelivr@SHA 备用源。
 
 > ⚠️ 不要写成 `sudo bash <(curl ...)`。
 > `<( )` 传的是进程私有的 `/dev/fd/N`，而 sudo 会关闭 3 及以上的 fd，

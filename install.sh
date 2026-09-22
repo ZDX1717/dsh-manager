@@ -26,6 +26,16 @@ PAYLOAD_NAME="dsh.sh"
 SELF_URL="$RAW_BASE/$SELF_NAME"
 PAYLOAD_URL="$RAW_BASE/$PAYLOAD_NAME"
 
+# 自建镜像（国内可直连，实测与上游逐字节一致）。
+# 放在内置源末尾：多数网络根本走不到它，只有 raw/Pages/jsDelivr 都不通时才会用到。
+# 即便被篡改，也会被上面的 SHA-256 门禁拦下，不会装入未知内容。
+MIRROR_RAW="https://github.zdx1717.ccwu.cc/raw/ZDX1717/dsh-manager/main"
+
+# GitHub API 基地址。网络屏蔽 api.github.com 时可指向自己的镜像，
+# 例如：DSH_GITHUB_API=https://your.mirror/proxy/api.github.com
+# 只用于解析 commit SHA；伪造 SHA 会让 jsDelivr@<sha> 返回 404，属失败安全。
+GITHUB_API="${DSH_GITHUB_API:-https://api.github.com}"
+
 INSTALL_DIR="${DSH_INSTALL_DIR:-/usr/local/bin}"
 TARGET_NAME="dsh-manager"
 TARGET_BIN="$INSTALL_DIR/$TARGET_NAME"
@@ -40,7 +50,7 @@ CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 # dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
 # 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
 # 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
-PAYLOAD_SHA256="2316fff6a16a1877099aea39032e0723b0d6508030744472e61f71a12a4887cf"
+PAYLOAD_SHA256="510066505b260747948d3a7df7f121db04d0e58d3189814d44ce1b12c8ea91aa"
 
 ASSUME_YES=0
 SKIP_VERIFY=0
@@ -59,7 +69,7 @@ resolve_commit_sha() {
     curl -fsSL \
         --connect-timeout "$CURL_CONNECT_TIMEOUT" \
         --max-time "$CURL_MAX_TIME" \
-        "https://api.github.com/repos/$owner/$repo/commits/$ref" 2>/dev/null \
+        "$GITHUB_API/repos/$owner/$repo/commits/$ref" 2>/dev/null \
         | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
         | head -n 1
 }
@@ -91,6 +101,15 @@ download_urls() {
     esac
 
     local m
+    # 自建镜像：排在所有内置源之后（多数网络走不到，只在前面全不通时启用）。
+    # 仅当主源仍指向上游本仓库时才加 —— 镜像只镜像这一份，
+    # 指向 fork 时加进来只会白白失败一次。
+    if [ "$MIRROR_RAW" != "$RAW_BASE" ]; then
+        case "$RAW_BASE" in
+            *ZDX1717/dsh-manager*) printf '%s\n' "$MIRROR_RAW/$rel" ;;
+        esac
+    fi
+
     for m in ${DSH_EXTRA_MIRRORS:-}; do
         printf '%s\n' "${m%/}/$rel"
     done
@@ -163,6 +182,9 @@ DSH 管理脚本安装器
   DSH_RAW_BASE           自定义下载源前缀
   DSH_EXTRA_MIRRORS      追加自定义镜像（空格分隔）
   DSH_INSTALL_DIR        安装目录（默认 /usr/local/bin）
+  DSH_GITHUB_API         GitHub API 基地址（解析 commit SHA 用）
+  DSH_CONNECT_TIMEOUT    单源连接超时（秒，默认 8）
+  DSH_MAX_TIME           单源总超时（秒，默认 30）
 EOF
 }
 

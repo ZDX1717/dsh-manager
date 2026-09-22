@@ -20,11 +20,18 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
 SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh}"
+# GitHub API 基地址（解析 commit SHA 用）。
+# 网络屏蔽 api.github.com 时可指向自建镜像：
+#   DSH_GITHUB_API=https://your.mirror/proxy/api.github.com
+# 伪造的 SHA 只会让 jsDelivr@<sha> 返回 404，属失败安全。
+GITHUB_API="${DSH_GITHUB_API:-https://api.github.com}"
+# 自建镜像（国内可直连），排在内置源末尾
+MIRROR_RAW="https://github.zdx1717.ccwu.cc/raw/ZDX1717/dsh-manager/main"
 # 下载超时：故意设得较短——有备用源兜底，宁可快速失败切换
 SCRIPT_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
 SCRIPT_MAX_TIME="${DSH_MAX_TIME:-30}"
@@ -322,7 +329,7 @@ resolve_commit_sha() {
     curl -fsSL \
         --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
         --max-time "$SCRIPT_MAX_TIME" \
-        "https://api.github.com/repos/$owner/$repo/commits/$ref" 2>/dev/null \
+        "$GITHUB_API/repos/$owner/$repo/commits/$ref" 2>/dev/null \
         | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
         | head -n 1
 }
@@ -380,6 +387,11 @@ script_update_urls() {
             ;;
     esac
     
+    # 自建镜像：排在所有内置源之后（前面全不通时才用到）
+    case "$SCRIPT_RAW_URL" in
+        *ZDX1717/dsh-manager*) printf '%s\n' "$MIRROR_RAW/$(basename "$SCRIPT_RAW_URL")" ;;
+    esac
+
     local m
     for m in $SCRIPT_EXTRA_MIRRORS; do
         printf '%s\n' "${m%/}/$(basename "$SCRIPT_RAW_URL")"
