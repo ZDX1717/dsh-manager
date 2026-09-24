@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -37,6 +37,8 @@ SCRIPT_CONNECT_TIMEOUT="${DSH_CONNECT_TIMEOUT:-8}"
 SCRIPT_MAX_TIME="${DSH_MAX_TIME:-30}"
 # 追加自定义镜像（空格分隔），例如国内加速前缀
 SCRIPT_EXTRA_MIRRORS="${DSH_EXTRA_MIRRORS:-}"
+# 用 NodeSource 源装 Node.js 时的默认主版本（LTS）
+NODE_MAJOR="${DSH_NODE_MAJOR:-24}"
 
 # ========== 终端颜色 ==========
 if [ -t 1 ]; then
@@ -152,6 +154,227 @@ pre_check() {
     return 0
 }
 
+# ========== 以 root 权限执行命令 ==========
+# 不看"是不是 root"，而是"当前能不能直接干"：非 root 一律走 sudo。
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# ========== 探测系统包管理器 ==========
+detect_pkg_mgr() {
+    local m
+    for m in apt-get dnf yum zypper pacman apk; do
+        if command -v "$m" >/dev/null 2>&1; then
+            printf '%s\n' "$m"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ========== 下载到文件（curl 优先，wget 兜底） ==========
+fetch_to_file() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
+            --max-time 60 "$url" -o "$out"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -O "$out" "$url"
+    else
+        return 127
+    fi
+}
+
+# ========== 用发行版自带仓库安装 nodejs / npm ==========
+install_node_via_distro() {
+    local pkg="$1"
+    echo
+    case "$pkg" in
+        apt-get)
+            echo "正在更新软件包索引..."
+            as_root apt-get update
+            echo "正在安装 nodejs / npm..."
+            # 少数发行版把 npm 拆成独立包且未必存在，失败则退化为只装 nodejs
+            if as_root apt-get install -y nodejs npm; then
+                return 0
+            fi
+            warn "nodejs npm 一并安装失败，尝试只安装 nodejs"
+            as_root apt-get install -y nodejs
+            ;;
+        dnf)
+            echo "正在安装 nodejs / npm..."
+            as_root dnf install -y nodejs npm
+            ;;
+        yum)
+            echo "正在安装 nodejs / npm..."
+            as_root yum install -y nodejs npm
+            ;;
+        zypper)
+            echo "正在安装 nodejs / npm..."
+            as_root zypper --non-interactive install nodejs npm
+            ;;
+        pacman)
+            echo "正在安装 nodejs / npm..."
+            as_root pacman -Sy --noconfirm nodejs npm
+            ;;
+        apk)
+            echo "正在安装 nodejs / npm..."
+            as_root apk add --no-cache nodejs npm
+            ;;
+        *)
+            err "不支持的包管理器：$pkg"
+            return 1
+            ;;
+    esac
+}
+
+# ========== 用 NodeSource 官方源安装较新版 Node.js ==========
+# 发行版仓库里的 Node 常年偏旧（DSH 对 Node 版本有要求），
+# 所以默认推荐 NodeSource；只支持 Debian/Ubuntu 与 RHEL/Fedora 系，
+# 其他发行版自动回退到自带仓库。
+install_node_via_nodesource() {
+    local pkg="$1"
+    local major=""
+    read -r -p "Node.js 主版本号 [默认 ${NODE_MAJOR}]： " major || major=""
+    [ -z "$major" ] && major="$NODE_MAJOR"
+    case "$major" in
+        ''|*[!0-9]*)
+            err "版本号必须是纯数字，例如 22 / 24"
+            return 1
+            ;;
+    esac
+
+    local base=""
+    case "$pkg" in
+        apt-get)
+            base="https://deb.nodesource.com/setup_${major}.x"
+            ;;
+        dnf|yum)
+            base="https://rpm.nodesource.com/setup_${major}.x"
+            ;;
+        *)
+            warn "NodeSource 仅支持 Debian/Ubuntu 与 RHEL/Fedora 系，改用发行版仓库"
+            install_node_via_distro "$pkg"
+            return $?
+            ;;
+    esac
+
+    # 先下载再执行，不用 curl | bash：这样下载失败/内容被替换时能自己判断
+    local tmp="/tmp/nodesource_setup_${major}.x.sh"
+    echo
+    echo "正在下载 NodeSource 源配置脚本：$base"
+    if ! fetch_to_file "$base" "$tmp"; then
+        rm -f "$tmp" 2>/dev/null
+        warn "下载失败（网络不通或被拦截），回退到发行版自带仓库"
+        install_node_via_distro "$pkg"
+        return $?
+    fi
+    if ! grep -q 'nodesource' "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        err "下载内容不像 NodeSource 脚本（可能被劫持或返回了错误页），已放弃"
+        echo "如需继续，可改用发行版仓库安装（菜单 16 里选 2）。"
+        return 1
+    fi
+
+    echo "正在配置 NodeSource 源..."
+    if ! as_root bash "$tmp"; then
+        rm -f "$tmp" 2>/dev/null
+        warn "NodeSource 源配置失败，回退到发行版自带仓库"
+        install_node_via_distro "$pkg"
+        return $?
+    fi
+    rm -f "$tmp" 2>/dev/null
+
+    echo "正在安装 nodejs..."
+    case "$pkg" in
+        apt-get) as_root apt-get install -y nodejs ;;
+        dnf)     as_root dnf install -y nodejs ;;
+        yum)     as_root yum install -y nodejs ;;
+    esac
+}
+
+# ========== 安装 Node.js 与 npm（菜单 16） ==========
+install_nodejs_npm() {
+    title "安装 Node.js 与 npm"
+
+    # ---------- 权限 ----------
+    if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+        err "需要 root 权限，但系统未安装 sudo"
+        echo "请用 root 登录后重新运行本脚本。"
+        return 1
+    fi
+
+    # ---------- 包管理器 ----------
+    local PKG=""
+    PKG=$(detect_pkg_mgr) || {
+        err "未识别到包管理器（apt-get/dnf/yum/zypper/pacman/apk）"
+        echo "请参考 https://nodejs.org/zh-cn/download 手动安装 Node.js 后重试。"
+        return 1
+    }
+
+    # ---------- 当前状态 ----------
+    local cur_node="" cur_npm=""
+    command -v node >/dev/null 2>&1 && cur_node=$(node --version 2>/dev/null)
+    command -v npm  >/dev/null 2>&1 && cur_npm=$(npm --version 2>/dev/null)
+    if [ -n "$cur_node" ] || [ -n "$cur_npm" ]; then
+        echo "当前 Node.js：${cur_node:-未安装}    npm：${cur_npm:-未安装}"
+    else
+        echo "当前状态：未安装 Node.js / npm"
+    fi
+    echo "包管理器：$PKG"
+    echo
+    echo "选择安装方式："
+    echo "  1. NodeSource 官方源（推荐，版本较新，默认 Node.js ${NODE_MAJOR}.x）"
+    echo "  2. 发行版自带仓库（最快，版本可能偏旧）"
+    echo "  0. 返回"
+    echo
+    local choice
+    read -r -p "请选择： " choice || { echo; return 0; }
+
+    case "$choice" in
+        1) install_node_via_nodesource "$PKG" ;;
+        2) install_node_via_distro "$PKG" ;;
+        0) return 0 ;;
+        *) warn "无效选项"; return 0 ;;
+    esac
+
+    # ---------- 统一以"node/npm 是否可用"作为最终判据 ----------
+    # 各安装方式的失败信息参差不齐，只看结果最可靠。
+    hash -r 2>/dev/null || true
+    echo
+    local new_node="" new_npm=""
+    command -v node >/dev/null 2>&1 && new_node=$(node --version 2>/dev/null)
+    command -v npm  >/dev/null 2>&1 && new_npm=$(npm --version 2>/dev/null)
+
+    if [ -n "$new_node" ] && [ -n "$new_npm" ]; then
+        info "Node.js 与 npm 安装完成"
+        echo "Node.js：$new_node"
+        echo "npm    ：$new_npm"
+        echo
+        echo "下一步：菜单 12「安装/更新 DSH 程序本体(npm)」安装 DSH。"
+        return 0
+    fi
+
+    err "安装流程已结束，但 Node.js / npm 仍不可用"
+    echo "  node：${new_node:-未找到}"
+    echo "  npm ：${new_npm:-未找到}"
+    echo
+    echo "可尝试手动安装："
+    echo "  Debian/Ubuntu："
+    echo "    curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -"
+    echo "    sudo apt-get install -y nodejs"
+    echo "  Fedora/RHEL："
+    echo "    curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo bash -"
+    echo "    sudo dnf install -y nodejs"
+    echo "  Arch：sudo pacman -S nodejs npm"
+    echo "若 node 已在别处安装，请确认其 bin 目录在 PATH 中。"
+    return 1
+}
+
 # ========== 更新DSH函数（npm全局更新本体） ==========
 # ========== 安装 / 更新 DSH 程序本体（npm） ==========
 # npm install -g 同时覆盖"全新安装"和"升级到最新"两种情况，
@@ -160,20 +383,28 @@ install_or_update_dsh() {
     title "安装 / 更新 DSH 程序本体"
     
     # ---------- 前置依赖：npm 与 node ----------
-    if ! command -v npm >/dev/null 2>&1; then
-        err "未找到 npm（DSH 通过 npm 全局安装）"
-        echo "请先安装 Node.js 与 npm，例如："
-        echo "  Debian/Ubuntu：apt install -y nodejs npm"
-        echo "  Fedora/RHEL  ：dnf install -y nodejs npm"
-        echo "  Arch         ：pacman -S nodejs npm"
+    if ! command -v npm >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+        err "未找到 Node.js / npm（DSH 通过 npm 全局安装）"
+        echo "DSH 依赖 Node.js 运行环境，npm 随 Node.js 一起安装。"
         echo
-        echo "若发行版自带版本过旧，建议用 NodeSource 源安装较新版 Node.js。"
-        return 1
-    fi
-    if ! command -v node >/dev/null 2>&1; then
-        err "检测到 npm 但未找到 node，Node.js 环境不完整"
-        echo "请重新安装 Node.js 后重试。"
-        return 1
+        read -r -p "是否现在自动安装 Node.js 与 npm？(y/N): " CONFIRM || CONFIRM=""
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            install_nodejs_npm
+            hash -r 2>/dev/null || true
+            echo
+            if ! command -v npm >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+                err "Node.js 环境仍不可用，无法继续安装 DSH"
+                return 1
+            fi
+        else
+            echo "可手动安装后再回来："
+            echo "  Debian/Ubuntu：sudo apt install -y nodejs npm"
+            echo "  Fedora/RHEL  ：sudo dnf install -y nodejs npm"
+            echo "  Arch         ：sudo pacman -S nodejs npm"
+            echo
+            echo "或用菜单 16「安装 Node.js 与 npm」走 NodeSource 源装较新版本。"
+            return 1
+        fi
     fi
     echo "Node.js：$(node --version 2>/dev/null)   npm：$(npm --version 2>/dev/null)"
     
@@ -2707,6 +2938,9 @@ menu() {
     echo "=== 会话维护 ==="
     echo "15. 扫描会话文件"
     echo
+    echo "=== 运行环境 ==="
+    echo "16. 安装 Node.js 与 npm"
+    echo
     echo "00. 更新管理脚本"
     echo
     echo "0. 退出脚本"
@@ -2743,6 +2977,7 @@ while true; do
         13) backup_restore_management ;;
         14) plugin_management ;;
         15) scan_and_fix_sessions ;;
+        16) install_nodejs_npm ;;
         00) update_self ;;
         0) echo "已退出"; exit 0 ;;
         *) warn "无效选项" ;;

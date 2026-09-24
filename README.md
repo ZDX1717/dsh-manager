@@ -100,6 +100,9 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 === 会话维护 ===
 15. 扫描会话文件
 
+=== 运行环境 ===
+16. 安装 Node.js 与 npm
+
 00. 更新管理脚本
 
 0. 退出脚本
