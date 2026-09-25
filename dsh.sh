@@ -952,36 +952,6 @@ restart_svc() {
     fi
 }
 
-# ========== 状态 ==========
-status_svc() {
-    title "${SVC} 服务状态"
-    
-    # 检查 DSH 安装状态
-    if check_dsh_installed; then
-        local VER
-        VER=$(get_dsh_version)
-        printf "DSH程序版本：%s\n" "$VER"
-        printf "DSH安装路径：%s\n\n" "$(which dsh 2>/dev/null || echo "$DSH_BIN")"
-    else
-        err "DSH 未安装"
-        echo
-    fi
-
-    # 检查服务状态
-    local UNIT="/etc/systemd/system/${SVC}.service"
-    if [ -f "$UNIT" ]; then
-        if is_run; then
-            info "服务状态：运行中"
-        else
-            err "服务状态：未运行"
-        fi
-        echo
-        sysctl status "$SVC" --no-pager -l | grep -E "Loaded|Active|PID"
-    else
-        warn "服务未初始化"
-    fi
-}
-
 # ========== 获取访问链接 ==========
 get_url() {
     if ! is_run; then
