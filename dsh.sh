@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1558,8 +1558,7 @@ backup_sessions() {
     
     echo "选择备份类型："
     echo "1. 仅对话记录（最小）- sessions/"
-    echo "2. 对话+插件+配置 - 推荐"
-    echo "3. 完整备份 - 再加附件等"
+    echo "2. 完整备份（推荐）- 含插件与附件"
     echo "0. 取消"
     read -r -p "请选择： " BACKUP_TYPE
 
@@ -1574,9 +1573,9 @@ backup_sessions() {
             echo "备份内容："
             echo "- 会话数据 (sessions/) - 全部对话记录"
             echo
-            echo "注意：本备份不含插件和设置。"
+            echo "注意：本备份不含插件、设置和附件。"
             echo "恢复到本机没问题（恢复只覆盖、不删除）；"
-            echo "换机器或重装后恢复请改用第 2 或第 3 种。"
+            echo "换机器或重装后恢复，请改用第 2 种完整备份。"
             echo
 
             start_backup_animation "正在创建备份"
@@ -1584,50 +1583,35 @@ backup_sessions() {
             cleanup_animation
             ;;
         2)
-            # ---------- 对话 + 插件 + 配置 ----------
-            backup_file=$(generate_backup_filename "dsh_data_backup")
-
-            echo
-            echo "正在执行备份（对话 + 插件 + 配置）..."
-            echo "备份内容："
-            echo "- 对话记录 (sessions/)"
-            echo "- 工作区配置 (storages/)"
-            echo "- 插件本体与配置 (profiles/，含 node_modules)"
-            echo "- 设置 (settings.yaml) 与登录凭据"
-            echo
-            echo "注意：含插件本体，体积较大（可能上百 MB）。"
-            echo "重装 DSH 后恢复即可保留全部数据与插件。"
-            echo
-
-            start_backup_animation "正在创建备份"
-            pack_dsh_backup "$backup_file" sessions storages profiles \
-                settings.yaml .anonymous-user-id .credentials.yaml
-            cleanup_animation
-            ;;
-        3)
             # ---------- 完整备份 ----------
+            # 整个 ~/.dsh 一把打包：插件、设置、凭据、附件、集成配置全在内，
+            # 比逐项列举更不容易漏（漏掉的项恢复时才会发现，代价很大）。
             backup_file=$(generate_backup_filename "dsh_full_backup")
 
             echo
             echo "正在执行完整备份..."
             echo "备份内容："
-            echo "- 第 2 种的全部内容"
+            echo "- 对话记录 (sessions/)"
+            echo "- 工作区配置 (storages/)"
+            echo "- 插件本体与配置 (profiles/，含 node_modules)"
             echo "- 附件 (attachments/)"
-            echo "- 集成与模型配置 (im/ integrations/ llm-*)"
+            echo "- 设置、登录凭据、集成与模型配置"
             echo
             echo "排除：backups/、cache/、telemetry/"
             echo
 
             start_backup_animation "正在创建完整备份"
-            # 直接打包整个 ~/.dsh，比逐项复制更省事也更完整。
-            # 注意：GNU tar 的 --exclude 是位置相关的选项，必须写在操作数
+            # 注意：GNU tar 的 --exclude 是位置相关选项，必须写在操作数
             # .dsh 之前，写在后面会被直接忽略。旧版就写在了后面，
-            # 结果 backups/（历次备份自身）和 cache/ 一直被塞进完整备份里。
+            # 结果 backups/（历次备份自身）和 cache/ 一直被塞进包里。
+            # .cache 不带斜杠写：GNU tar 默认非锚定匹配，能命中任意深度的
+            # 同名目录（与 rsync --exclude='.cache' 一致）；写成
+            # .dsh/profiles/*/.cache 反而只能匹配一层深，深层排除不掉。
             tar -czf "$backup_file" -C "$HOME" \
                 --exclude='.dsh/backups' \
                 --exclude='.dsh/cache' \
                 --exclude='.dsh/telemetry' \
-                --exclude='.dsh/profiles/*/.cache' \
+                --exclude='.cache' \
                 .dsh 2>/dev/null
             cleanup_animation
             ;;
