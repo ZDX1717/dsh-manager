@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -333,8 +333,8 @@ install_nodejs_npm() {
     echo "包管理器：$PKG"
     echo
     echo "选择安装方式："
-    echo "  1. NodeSource 官方源（推荐，版本较新，默认 Node.js ${NODE_MAJOR}.x）"
-    echo "  2. 发行版自带仓库（最快，版本可能偏旧）"
+    echo "  1. NodeSource 官方源（推荐，版本新）"
+    echo "  2. 发行版自带仓库（快，可能旧）"
     echo "  0. 返回"
     echo
     local choice
@@ -1328,9 +1328,9 @@ uninstall_management() {
         clear 2>/dev/null
         echo "=== 卸载 ==="
         echo
-        echo "1. 卸载 systemd 服务（保留 DSH 程序与管理脚本）"
-        echo "2. 卸载 DSH 程序本体（npm，保留数据）"
-        echo "3. 完全卸载（服务 + DSH 程序 + 管理脚本，保留数据）"
+        echo "1. 卸载 systemd 服务（保留程序）"
+        echo "2. 卸载 DSH 程序本体（保留数据）"
+        echo "3. 完全卸载（服务+程序+脚本）"
         echo "0. 返回"
         echo
         read -r -p "请选择： " choice || { echo; return 0; }
@@ -3100,19 +3100,17 @@ status_and_logs() {
             fi
         fi
 
-        printf "服务      %s    ${STATE_COLOR}%s${RST}" "$SVC" "$STATE_TXT"
-        [ -n "$UPTIME_TXT" ] && printf "    已运行 %s" "$UPTIME_TXT"
-        [ -n "$RESTARTS" ] && [ "$RESTARTS" != "0" ] && printf "    重启 %s 次" "$RESTARTS"
+        # 一行一个字段：窄终端下横向拼接必然换行
+        printf "服务    %s\n" "$SVC"
+        printf "状态    ${STATE_COLOR}%s${RST}\n" "$STATE_TXT"
         case "$ENABLED" in
-            enabled)  printf "    开机自启 是" ;;
-            disabled) printf "    开机自启 否" ;;
+            enabled)  printf "自启    是\n" ;;
+            disabled) printf "自启    否\n" ;;
         esac
-        printf "\n"
-
+        [ -n "$UPTIME_TXT" ] && printf "运行    %s\n" "$UPTIME_TXT"
+        [ -n "$RESTARTS" ] && [ "$RESTARTS" != "0" ] && printf "重启    %s 次\n" "$RESTARTS"
         if [ -n "$MAINPID" ] && [ "$MAINPID" != "0" ]; then
-            printf "主进程    PID %s\n" "$MAINPID"
-        else
-            printf "主进程    —\n"
+            printf "主进程  PID %s\n" "$MAINPID"
         fi
 
         # ---------- ② 业务层：端口 ----------
@@ -3124,9 +3122,9 @@ status_and_logs() {
         fi
         if [ -n "$PORTLINE" ]; then
             LISTEN=1
-            printf "监听      %s (LISTEN)\n" "$(printf '%s' "$PORTLINE" | awk '{print $4}')"
+            printf "监听    %s\n" "$(printf '%s' "$PORTLINE" | awk '{print $4}')"
         else
-            printf "监听      端口 %s 未监听\n" "$DSH_PORT"
+            printf "监听    端口 %s 未监听\n" "$DSH_PORT"
         fi
 
         # ---------- ③ 结论 ----------
@@ -3243,13 +3241,17 @@ alias_menu() {
 }
 
 # ========== 菜单 ==========
+# 排版约束：每一行都要能在 50 列的窄终端里不换行。
+#   · 选项一律不带说明文字——窄终端下注释正是换行的元凶；
+#     选项名本身够自解释，不确定就按进去看，子菜单 0 一律返回。
+#   · 状态拆成几行短行，不用 ｜ 拼长行（全角分隔符本身就是宽字符）。
 menu() {
     clear 2>/dev/null
 
-    # 标题自带脚本版本号——全局只有这一处，反馈问题时看第一行即可
-    printf "${BLD}=========== DSH-Web 管理面板 v%s ===========${RST}\n" "$SCRIPT_VERSION"
+    printf "${BLD}==== DSH-Web 管理面板 v%s ====${RST}\n" "$SCRIPT_VERSION"
+    echo
 
-    # 状态行：DSH 版本 / 服务名 / 运行状态 / 端口 / PID
+    # ---- 状态区：每行都短 ----
     local DSH_TXT="" DSH_COLOR="$GRN"
     if check_dsh_installed; then
         DSH_TXT=$(get_dsh_version)
@@ -3274,26 +3276,29 @@ menu() {
         fi
     fi
 
-    printf "DSH ${DSH_COLOR}%s${RST} ｜ %s [${STATE_COLOR}%s${RST}] ｜ 端口 %s" \
-        "$DSH_TXT" "$SVC" "$STATE_TXT" "$DSH_PORT"
+    printf "DSH   ${DSH_COLOR}%s${RST}\n" "$DSH_TXT"
+    printf "服务  %s  ${STATE_COLOR}%s${RST}\n" "$SVC" "$STATE_TXT"
     if [ -n "$PID_TXT" ] && [ "$PID_TXT" != "0" ]; then
-        printf " ｜ PID %s" "$PID_TXT"
+        printf "端口  %s   PID %s\n" "$DSH_PORT" "$PID_TXT"
+    else
+        printf "端口  %s\n" "$DSH_PORT"
     fi
-    printf "\n"
     if ! check_dsh_installed; then
         printf "${YEL}DSH 未安装，输入 1 一键开始${RST}\n"
     fi
     echo
 
-    echo " 1. 快速开始              安装 / 初始化 / 启动，一步到位"
-    echo
-    echo " 2. 启动      3. 停止      4. 重启"
-    echo " 5. 获取 Token 链接      6. 状态与日志"
-    echo
-    echo " 7. 插件管理              启用 / 禁用 / 删除"
-    echo " 8. 备份与恢复            最小 / 完整备份、恢复、清理"
-    echo " 9. 维护工具              服务名 / 快捷命令 / Node 环境 / 会话修复"
-    echo "10. 卸载                  服务 / DSH 程序 / 本管理脚本"
+    # ---- 选项区：一项一行，不带注释 ----
+    echo " 1. 快速开始"
+    echo " 2. 启动"
+    echo " 3. 停止"
+    echo " 4. 重启"
+    echo " 5. 获取 Token 链接"
+    echo " 6. 状态与日志"
+    echo " 7. 插件管理"
+    echo " 8. 备份与恢复"
+    echo " 9. 维护工具"
+    echo "10. 卸载"
     echo
     echo "00. 更新管理脚本"
     echo " 0. 退出"
