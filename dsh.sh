@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.5.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -67,6 +67,16 @@ sysctl() {
         systemctl "$@"
     else
         sudo systemctl "$@"
+    fi
+}
+
+# ========== journalctl 调用前缀（非 root 走 sudo） ==========
+# 用法：JC=$(journal_cmd); $JC -u "$SVC" -n 20   （故意不加引号，靠分词传参）
+journal_cmd() {
+    if [ "$(id -u)" -eq 0 ]; then
+        printf 'journalctl'
+    else
+        printf 'sudo journalctl'
     fi
 }
 
@@ -132,17 +142,12 @@ get_dsh_version() {
 # ========== 安装引导 ==========
 install_guide() {
     title "DSH 未安装"
-    echo "DSH 程序本体尚未安装。安装方式："
+    echo "DSH 程序本体尚未安装。最省事的做法："
     echo
-    echo "  方式一（推荐）：在本管理面板里直接安装"
-    echo "    菜单 12「安装/更新 DSH 程序本体(npm)」"
+    echo "  回主菜单按 1「快速开始」，会自动完成："
+    echo "    Node.js/npm → DSH 本体 → systemd 服务 → 启动 → 给出访问链接"
     echo
-    echo "  方式二：手动执行"
-    echo "    npm install -g @deepseek-ai/dsh"
-    echo
-    echo "  方式三：下载二进制文件到 $DSH_BIN"
-    echo
-    echo "安装后回到菜单 7「初次初始化 Systemd 服务」，再启动服务。"
+    echo "  也可以手动执行：npm install -g @deepseek-ai/dsh"
 }
 
 # ========== 预检查 ==========
@@ -276,7 +281,7 @@ install_node_via_nodesource() {
     if ! grep -q 'nodesource' "$tmp" 2>/dev/null; then
         rm -f "$tmp" 2>/dev/null
         err "下载内容不像 NodeSource 脚本（可能被劫持或返回了错误页），已放弃"
-        echo "如需继续，可改用发行版仓库安装（菜单 16 里选 2）。"
+        echo "如需继续，可改用发行版仓库安装（主菜单 9 → 3，安装方式选 2）。"
         return 1
     fi
 
@@ -297,7 +302,7 @@ install_node_via_nodesource() {
     esac
 }
 
-# ========== 安装 Node.js 与 npm（菜单 16） ==========
+# ========== 安装 Node.js 与 npm（菜单 9 → 3） ==========
 install_nodejs_npm() {
     title "安装 Node.js 与 npm"
 
@@ -355,7 +360,7 @@ install_nodejs_npm() {
         echo "Node.js：$new_node"
         echo "npm    ：$new_npm"
         echo
-        echo "下一步：菜单 12「安装/更新 DSH 程序本体(npm)」安装 DSH。"
+        echo "下一步：回主菜单按 1「快速开始」继续安装 DSH。"
         return 0
     fi
 
@@ -402,7 +407,7 @@ install_or_update_dsh() {
             echo "  Fedora/RHEL  ：sudo dnf install -y nodejs npm"
             echo "  Arch         ：sudo pacman -S nodejs npm"
             echo
-            echo "或用菜单 16「安装 Node.js 与 npm」走 NodeSource 源装较新版本。"
+            echo "或用 主菜单 9 → 3「安装 Node.js 与 npm」走 NodeSource 源装较新版本。"
             return 1
         fi
     fi
@@ -531,9 +536,9 @@ install_or_update_dsh() {
     else
         echo
         if [ $installed -eq 0 ]; then
-            echo "提示：服务尚未初始化，可用菜单 7「初次初始化 Systemd 服务」创建。"
+            echo "提示：服务尚未初始化，可用菜单 1「快速开始」创建。"
         else
-            echo "提示：服务尚未初始化，可用菜单 7 创建后再启动。"
+            echo "提示：服务尚未初始化，可用菜单 1 创建后再启动。"
         fi
     fi
 }
@@ -1178,7 +1183,7 @@ uninstall_dsh() {
     echo
     info "说明：卸载程序本体不会删除你的数据"
     echo "  会话与配置仍在：$HOME/.dsh"
-    echo "  如需保留，建议先用菜单 13「备份与恢复管理」导出"
+    echo "  如需保留，建议先用菜单 8「备份与恢复」导出"
     echo
     
     local CONFIRM
@@ -2700,7 +2705,7 @@ report_corrupted_session() {
         echo "     大小：$(stat -c%s "$session_file" 2>/dev/null) 字节"
     fi
     echo "     可选处理："
-    echo "       1) 有正常时期的备份 → 菜单 13「恢复对话记录」"
+    echo "       1) 有正常时期的备份 → 菜单 8「恢复对话记录」"
     echo "       2) 否则该会话无法恢复，可删除该会话目录后重新开始"
     return 1
 }
@@ -2765,7 +2770,7 @@ scan_and_fix_sessions() {
         warn "共发现 $corrupted_sessions 个损坏会话"
         echo "这类日志是压缩的追加式文件，损坏后无法在本脚本内安全重建。"
         echo "建议："
-        echo "  1. 有正常时期的备份 → 菜单 13「恢复对话记录」"
+        echo "  1. 有正常时期的备份 → 菜单 8「恢复对话记录」"
         echo "  2. 确认 DSH 已停止后再操作，避免写入中的文件被复制"
         echo "  3. 无法恢复的会话，可删除其会话目录后重新开始"
     else
@@ -2774,7 +2779,7 @@ scan_and_fix_sessions() {
     
     echo
     echo "提示：本功能只检测、不修改任何会话文件。"
-    echo "如需从备份恢复，请用菜单 13；操作前建议先停止服务："
+    echo "如需从备份恢复，请用菜单 8；操作前建议先停止服务："
     echo "  systemctl stop $SVC"
 }
 
@@ -2806,7 +2811,7 @@ add_alias_to_bashrc() {
     if grep -qE "^alias[[:space:]]+d=" "$BASHRC" 2>/dev/null; then
         warn ".bashrc 中已存在 d 别名，未重复添加"
         echo "  现有定义：$(grep -E '^alias[[:space:]]+d=' "$BASHRC" | head -n 1)"
-        echo "  如需改用本脚本，请先用菜单 11 移除，或手动删除该行"
+        echo "  如需改用本脚本，请先用 菜单 9 → 2 移除，或手动删除该行"
         return 0
     fi
     
@@ -2880,70 +2885,335 @@ remove_alias_from_bashrc() {
     echo "  或重新登录终端"
 }
 
+# ========== 菜单 1：快速开始 ==========
+# 新手只需要记住这一个入口：把"从零到能打开面板"串成一条自动流程。
+# 每一步失败就停下并说明原因，不带着半成品继续往下跑。
+quick_start() {
+    title "快速开始"
+    echo "将按顺序执行：Node.js 环境 → DSH 本体 → systemd 服务 → 启动并给出访问链接"
+    echo
+
+    # ---------- [1/4] Node.js / npm ----------
+    echo "[1/4] Node.js / npm"
+    if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+        echo "      已就绪：node $(node --version 2>/dev/null)  npm $(npm --version 2>/dev/null)"
+    else
+        warn "缺少 Node.js / npm"
+        local CONFIRM
+        read -r -p "      现在安装？(y/N): " CONFIRM || CONFIRM=""
+        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+            warn "已取消，快速开始中止"
+            return 1
+        fi
+        install_nodejs_npm
+        hash -r 2>/dev/null || true
+        if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+            err "Node.js 环境不可用，快速开始中止"
+            echo "可稍后单独安装：主菜单 9 → 3"
+            return 1
+        fi
+    fi
+    echo
+
+    # ---------- [2/4] DSH 本体 ----------
+    echo "[2/4] DSH 本体"
+    if ! install_or_update_dsh; then
+        err "DSH 本体未就绪，快速开始中止"
+        return 1
+    fi
+    echo
+
+    # ---------- [3/4] systemd 服务 ----------
+    echo "[3/4] systemd 服务"
+    if [ -f "/etc/systemd/system/${SVC}.service" ]; then
+        echo "      服务已存在（$SVC），跳过初始化"
+    else
+        if ! init_systemd; then
+            err "服务初始化失败，快速开始中止"
+            return 1
+        fi
+    fi
+    echo
+
+    # ---------- [4/4] 启动 + 访问链接 ----------
+    echo "[4/4] 启动服务并获取访问链接"
+    if is_run; then
+        echo "      服务已在运行"
+    else
+        start_svc
+        if ! is_run; then
+            err "服务启动失败，快速开始中止"
+            echo "可回主菜单按 6「状态与日志」查看原因。"
+            return 1
+        fi
+    fi
+    echo
+
+    get_url
+    echo
+    info "快速开始全部完成"
+}
+
+# ========== 把秒数说成人话 ==========
+human_duration() {
+    local s="$1"
+    local d=$((s / 86400))
+    local h=$(((s % 86400) / 3600))
+    local m=$(((s % 3600) / 60))
+    if [ "$d" -gt 0 ]; then
+        printf '%d 天 %d 小时' "$d" "$h"
+    elif [ "$h" -gt 0 ]; then
+        printf '%d 小时 %d 分' "$h" "$m"
+    else
+        printf '%d 分' "$m"
+    fi
+}
+
+# ========== 菜单 6：状态与日志 ==========
+# 设计目标：一屏回答"现在正常吗"，答不上再往下钻。
+#   ① 问 systemd（服务层） ② 看端口（业务层） ③ 给结论 ④ 贴日志
+# 全程只读，不改任何状态；日志放在最后，是"结论的展开"，不是独立功能。
+status_and_logs() {
+    local UNIT="/etc/systemd/system/${SVC}.service"
+    local JC
+    JC=$(journal_cmd)
+
+    while true; do
+        clear 2>/dev/null
+        title "状态与日志"
+
+        local HAS_UNIT=0
+        [ -f "$UNIT" ] && HAS_UNIT=1
+
+        # ---------- ① 服务层 ----------
+        local ACTIVE="" MAINPID="" RESTARTS="" ENABLED=""
+        if [ "$HAS_UNIT" -eq 1 ]; then
+            ACTIVE=$(sysctl show -p ActiveState --value "$SVC" 2>/dev/null | tr -d ' ')
+            MAINPID=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+            RESTARTS=$(sysctl show -p NRestarts --value "$SVC" 2>/dev/null | tr -d ' ')
+            ENABLED=$(sysctl is-enabled "$SVC" 2>/dev/null)
+        fi
+
+        local STATE_TXT="" STATE_COLOR="$GRN"
+        if [ "$HAS_UNIT" -eq 0 ]; then
+            STATE_TXT="未初始化"; STATE_COLOR="$YEL"
+        elif [ "$ACTIVE" = "active" ]; then
+            STATE_TXT="运行中"
+        elif [ "$ACTIVE" = "failed" ]; then
+            STATE_TXT="启动失败"; STATE_COLOR="$RED"
+        else
+            STATE_TXT="未运行"; STATE_COLOR="$RED"
+        fi
+
+        local UPTIME_TXT=""
+        if [ "$ACTIVE" = "active" ]; then
+            local TS EPOCH NOW
+            TS=$(sysctl show -p ActiveEnterTimestamp --value "$SVC" 2>/dev/null)
+            EPOCH=$(date -d "$TS" +%s 2>/dev/null)
+            NOW=$(date +%s)
+            # date -d 是 GNU 扩展，busybox 下会失败，此时不显示运行时长即可
+            if [ -n "$EPOCH" ] && [ "$EPOCH" -gt 0 ] 2>/dev/null; then
+                UPTIME_TXT=$(human_duration $((NOW - EPOCH)))
+            fi
+        fi
+
+        printf "服务      %s    ${STATE_COLOR}%s${RST}" "$SVC" "$STATE_TXT"
+        [ -n "$UPTIME_TXT" ] && printf "    已运行 %s" "$UPTIME_TXT"
+        [ -n "$RESTARTS" ] && [ "$RESTARTS" != "0" ] && printf "    重启 %s 次" "$RESTARTS"
+        case "$ENABLED" in
+            enabled)  printf "    开机自启 是" ;;
+            disabled) printf "    开机自启 否" ;;
+        esac
+        printf "\n"
+
+        if [ -n "$MAINPID" ] && [ "$MAINPID" != "0" ]; then
+            printf "主进程    PID %s\n" "$MAINPID"
+        else
+            printf "主进程    —\n"
+        fi
+
+        # ---------- ② 业务层：端口 ----------
+        local PORTLINE="" LISTEN=0
+        if command -v ss >/dev/null 2>&1; then
+            PORTLINE=$(ss -ltn 2>/dev/null | grep -E "[:.]${DSH_PORT}[[:space:]]" | head -n1)
+        elif command -v netstat >/dev/null 2>&1; then
+            PORTLINE=$(netstat -ltn 2>/dev/null | grep -E "[:.]${DSH_PORT}[[:space:]]" | head -n1)
+        fi
+        if [ -n "$PORTLINE" ]; then
+            LISTEN=1
+            printf "监听      %s (LISTEN)\n" "$(printf '%s' "$PORTLINE" | awk '{print $4}')"
+        else
+            printf "监听      端口 %s 未监听\n" "$DSH_PORT"
+        fi
+
+        # ---------- ③ 结论 ----------
+        echo
+        if [ "$HAS_UNIT" -eq 0 ]; then
+            warn "结论：服务尚未初始化 —— 回主菜单按 1「快速开始」"
+        elif [ "$ACTIVE" != "active" ]; then
+            err "结论：服务未运行 —— 主菜单按 2 可启动"
+        elif [ "$LISTEN" -eq 1 ]; then
+            info "结论：运行正常"
+        else
+            warn "结论：进程在跑，但端口 $DSH_PORT 未监听（可能在启动中，或监听地址被改过）"
+        fi
+
+        # ---------- ④ 日志 ----------
+        echo
+        echo "最近日志（末尾 20 行）"
+        local LOGS
+        LOGS=$($JC -u "$SVC" -n 20 --no-pager 2>/dev/null)
+        if [ -n "$LOGS" ]; then
+            printf '%s\n' "$LOGS" | sed 's/^/  /'
+        else
+            echo "  （读不到日志：服务未初始化，或缺少 root 权限）"
+        fi
+
+        echo
+        echo "1. 进入实时日志（Ctrl+C 退出）"
+        echo "2. 只看错误级别日志"
+        echo "3. 刷新"
+        echo "0. 返回"
+        echo
+        local choice
+        read -r -p "请选择： " choice || { echo; return 0; }
+
+        case "$choice" in
+            1)
+                echo
+                show_logs
+                ;;
+            2)
+                echo
+                echo "错误级别日志（末尾 50 行）"
+                $JC -u "$SVC" -p err -n 50 --no-pager 2>/dev/null
+                ;;
+            3)
+                continue
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选项"
+                ;;
+        esac
+
+        echo
+        printf "按回车继续..."
+        read -r null || { echo; return 0; }
+    done
+}
+
+# ========== 菜单 9：维护工具 ==========
+maintenance_menu() {
+    while true; do
+        clear 2>/dev/null
+        title "维护工具"
+        echo "1. 修改 systemd 服务名称（当前：$SVC）"
+        echo "2. 快捷命令 .bashrc（添加 / 移除）"
+        echo "3. 安装 Node.js 与 npm"
+        echo "4. 扫描修复会话文件"
+        echo "0. 返回"
+        echo
+        local choice
+        read -r -p "请选择： " choice || { echo; return 0; }
+
+        case "$choice" in
+            1) rename_svc ;;
+            2) alias_menu ;;
+            3) install_nodejs_npm ;;
+            4) scan_and_fix_sessions ;;
+            0) return 0 ;;
+            *) warn "无效选项"; continue ;;
+        esac
+
+        echo
+        printf "按回车继续..."
+        read -r null || { echo; return 0; }
+    done
+}
+
+# 快捷命令的加/删合成一项，不再各占一个主菜单位
+alias_menu() {
+    while true; do
+        clear 2>/dev/null
+        title "快捷命令 .bashrc"
+        echo "1. 添加（alias d='$TARGET_NAME'）"
+        echo "2. 移除"
+        echo "0. 返回"
+        echo
+        local choice
+        read -r -p "请选择： " choice || { echo; return 0; }
+
+        case "$choice" in
+            1) add_alias_to_bashrc ;;
+            2) remove_alias_from_bashrc ;;
+            0) return 0 ;;
+            *) warn "无效选项"; continue ;;
+        esac
+
+        echo
+        printf "按回车继续..."
+        read -r null || { echo; return 0; }
+    done
+}
+
 # ========== 菜单 ==========
 menu() {
     clear 2>/dev/null
-    
-    # 标题部分 - 左对齐
-    printf "${BLD}========== DSH‑WEB 管理面板 ==========${RST}\n"
-    
-    # 显示 DSH 安装状态
+
+    # 标题自带脚本版本号——全局只有这一处，反馈问题时看第一行即可
+    printf "${BLD}=========== DSH-Web 管理面板 v%s ===========${RST}\n" "$SCRIPT_VERSION"
+
+    # 状态行：DSH 版本 / 服务名 / 运行状态 / 端口 / PID
+    local DSH_TXT="" DSH_COLOR="$GRN"
     if check_dsh_installed; then
-        local VER
-        VER=$(get_dsh_version)
-        printf "DSH版本：${GRN}%s${RST}\n" "$VER"
+        DSH_TXT=$(get_dsh_version)
     else
-        printf "DSH状态：${RED}未安装${RST}\n"
+        DSH_TXT="未安装"; DSH_COLOR="$RED"
     fi
-    
-    printf "当前服务：${GRN}%s${RST}\n" "$SVC"
 
-    # 显示服务状态
     local UNIT="/etc/systemd/system/${SVC}.service"
-    if [ -f "$UNIT" ]; then
-        if is_run; then
-            printf "运行状态：${GRN}运行中${RST}\n"
-        else
-            printf "运行状态：${RED}未运行${RST}\n"
-        fi
+    local STATE_TXT="" STATE_COLOR="$GRN" PID_TXT=""
+    if [ ! -f "$UNIT" ]; then
+        STATE_TXT="未初始化"; STATE_COLOR="$YEL"
     else
-        printf "运行状态：${YEL}未初始化${RST}\n"
+        local ACTIVE
+        ACTIVE=$(sysctl show -p ActiveState --value "$SVC" 2>/dev/null | tr -d ' ')
+        if [ "$ACTIVE" = "active" ]; then
+            STATE_TXT="运行中"
+            PID_TXT=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+        elif [ "$ACTIVE" = "failed" ]; then
+            STATE_TXT="启动失败"; STATE_COLOR="$RED"
+        else
+            STATE_TXT="未运行"; STATE_COLOR="$RED"
+        fi
     fi
 
+    printf "DSH ${DSH_COLOR}%s${RST} ｜ %s [${STATE_COLOR}%s${RST}] ｜ 端口 %s" \
+        "$DSH_TXT" "$SVC" "$STATE_TXT" "$DSH_PORT"
+    if [ -n "$PID_TXT" ] && [ "$PID_TXT" != "0" ]; then
+        printf " ｜ PID %s" "$PID_TXT"
+    fi
+    printf "\n"
+    if ! check_dsh_installed; then
+        printf "${YEL}DSH 未安装，输入 1 一键开始${RST}\n"
+    fi
     echo
-    echo "=== 服务管理 ==="
-    echo "1. 启动"
-    echo "2. 停止"
-    echo "3. 重启"
-    echo "4. 查看状态"
+
+    echo " 1. 快速开始              安装 / 初始化 / 启动，一步到位"
     echo
-    echo "=== 访问与调试 ==="
-    echo "5. 获取 Token 访问链接"
-    echo "6. 查看实时日志"
+    echo " 2. 启动      3. 停止      4. 重启"
+    echo " 5. 获取 Token 链接      6. 状态与日志"
     echo
-    echo "=== 安装与配置 ==="
-    echo "7. 初次初始化 Systemd 服务"
-    echo "8. 修改 systemd 服务名称"
-    echo "9. 卸载（服务/程序/管理脚本）"
-    echo "10. 添加快捷命令到 .bashrc"
-    echo "11. 移除快捷命令从 .bashrc"
-    echo "12. 安装/更新 DSH 程序本体(npm)"
-    echo
-    echo "=== 备份与恢复 ==="
-    echo "13. 备份与恢复管理"
-    echo
-    echo "=== 插件管理 ==="
-    echo "14. 插件管理"
-    echo
-    echo "=== 会话维护 ==="
-    echo "15. 扫描会话文件"
-    echo
-    echo "=== 运行环境 ==="
-    echo "16. 安装 Node.js 与 npm"
+    echo " 7. 插件管理              启用 / 禁用 / 删除"
+    echo " 8. 备份与恢复            最小 / 完整备份、恢复、清理"
+    echo " 9. 维护工具              服务名 / 快捷命令 / Node 环境 / 会话修复"
+    echo "10. 卸载                  服务 / DSH 程序 / 本管理脚本"
     echo
     echo "00. 更新管理脚本"
-    echo
-    echo "0. 退出脚本"
+    echo " 0. 退出"
     echo
     printf "请输入选项："
 }
@@ -2962,22 +3232,16 @@ while true; do
         exit 0
     fi
     case $opt in
-        1) start_svc ;;
-        2) stop_svc ;;
-        3) restart_svc ;;
-        4) status_svc ;;
+        1) quick_start ;;
+        2) start_svc ;;
+        3) stop_svc ;;
+        4) restart_svc ;;
         5) get_url ;;
-        6) show_logs ;;
-        7) init_systemd ;;
-        8) rename_svc ;;
-        9) uninstall_management ;;
-        10) add_alias_to_bashrc ;;
-        11) remove_alias_from_bashrc ;;
-        12) install_or_update_dsh ;;
-        13) backup_restore_management ;;
-        14) plugin_management ;;
-        15) scan_and_fix_sessions ;;
-        16) install_nodejs_npm ;;
+        6) status_and_logs ;;
+        7) plugin_management ;;
+        8) backup_restore_management ;;
+        9) maintenance_menu ;;
+        10) uninstall_management ;;
         00) update_self ;;
         0) echo "已退出"; exit 0 ;;
         *) warn "无效选项" ;;
