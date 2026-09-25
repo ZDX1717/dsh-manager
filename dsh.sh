@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1483,8 +1483,8 @@ backup_sessions() {
     fi
     
     echo "选择备份类型："
-    echo "1. 最小备份（推荐） - 只备份会话和配置"
-    echo "2. 完整备份 - 备份所有数据"
+    echo "1. 最小备份（推荐）- 会话/插件/配置"
+    echo "2. 完整备份 - 以上 + 其他文件"
     echo "0. 取消"
     read -r -p "请选择： " BACKUP_TYPE
     
@@ -2221,18 +2221,16 @@ test_backup_restore() {
     echo "测试完成"
 }
 
-# 备份与恢复管理（整合所有备份功能）
+# 备份与恢复（菜单 8：会话 + 插件 + 配置）
 backup_restore_management() {
-    title "备份与恢复管理"
-    
-    # 主循环
+    # 标题交给循环内的 clear + echo，避免进入时打两遍标题
     while true; do
         clear 2>/dev/null
-        echo "=== 备份与恢复管理 ==="
+        echo "=== 备份与恢复 ==="
         echo
         echo "操作："
-        echo "1. 备份对话记录"
-        echo "2. 恢复对话记录"
+        echo "1. 备份 DSH 数据"
+        echo "2. 恢复 DSH 数据"
         echo "3. 管理备份列表"
         echo "4. 测试备份恢复"
         echo "0. 返回"
@@ -2241,11 +2239,11 @@ backup_restore_management() {
         
         case $choice in
             1)
-                # 备份对话记录
+                # 备份 DSH 数据
                 backup_sessions
                 ;;
             2)
-                # 恢复对话记录
+                # 恢复 DSH 数据
                 restore_sessions
                 ;;
             3)
@@ -2703,7 +2701,7 @@ report_corrupted_session() {
         echo "     大小：$(stat -c%s "$session_file" 2>/dev/null) 字节"
     fi
     echo "     可选处理："
-    echo "       1) 有正常时期的备份 → 菜单 8「恢复对话记录」"
+    echo "       1) 有正常时期的备份 → 菜单 8「恢复 DSH 数据」"
     echo "       2) 否则该会话无法恢复，可删除该会话目录后重新开始"
     return 1
 }
@@ -2768,7 +2766,7 @@ scan_and_fix_sessions() {
         warn "共发现 $corrupted_sessions 个损坏会话"
         echo "这类日志是压缩的追加式文件，损坏后无法在本脚本内安全重建。"
         echo "建议："
-        echo "  1. 有正常时期的备份 → 菜单 8「恢复对话记录」"
+        echo "  1. 有正常时期的备份 → 菜单 8「恢复 DSH 数据」"
         echo "  2. 确认 DSH 已停止后再操作，避免写入中的文件被复制"
         echo "  3. 无法恢复的会话，可删除其会话目录后重新开始"
     else
