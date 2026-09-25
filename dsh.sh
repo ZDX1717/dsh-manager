@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.7.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1463,7 +1463,7 @@ generate_backup_filename() {
 # ---------- 备份类型：前缀即类型，列表/清理都靠它区分 ----------
 # dialogue = 仅对话记录；data = 对话+插件+配置；full = 完整
 # sessions 是 1.5.3 以前的旧前缀（当时内容其实等于 data），保留兼容
-BACKUP_PREFIXES="dsh_dialogue_backup|dsh_data_backup|dsh_sessions_backup|dsh_full_backup"
+BACKUP_PREFIXES="dsh_dialogue_backup|dsh_data_backup|dsh_sessions_backup|dsh_full_backup|dsh_plugins_backup"
 
 # 由文件名判断备份类型，给用户看的短标签
 backup_kind() {
@@ -1471,6 +1471,7 @@ backup_kind() {
         dsh_dialogue_backup*) echo "仅对话" ;;
         dsh_data_backup*|dsh_sessions_backup*) echo "对话+插件" ;;
         dsh_full_backup*)     echo "完整" ;;
+        dsh_plugins_backup*)  echo "插件清单" ;;
         *)                    echo "未知" ;;
     esac
 }
@@ -1534,6 +1535,209 @@ start_backup_animation() {
     ANIMATION_PID=$!
 }
 
+# ---------- 备份清单的枚举与识别 ----------
+# 数据备份是 .tar.gz 目录归档，插件清单是 .list 文本；统一在这里按前缀过滤
+list_backups() {
+    ls -1 "$BACKUP_DIR"/*.tar.gz "$BACKUP_DIR"/*.list 2>/dev/null \
+        | grep -E "($BACKUP_PREFIXES)" | sort -r
+}
+
+is_plugin_manifest() {
+    case "$1" in
+        dsh_plugins_backup*|*.list) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# dsh 可执行文件：优先脚本配置的路径，其次 PATH
+dsh_cmd() {
+    if [ -x "$DSH_BIN" ]; then
+        printf '%s\n' "$DSH_BIN"
+    elif command -v dsh >/dev/null 2>&1; then
+        command -v dsh
+    else
+        printf 'dsh\n'
+    fi
+}
+
+# 读 profile 的插件与 bundle 清单，输出 "plugin=名字@版本" / "declared=..." / "bundle=..."
+# 用 node 解析 JSON —— DSH 本身就依赖 node，等于零额外依赖，
+# 比自己用 sed 抠 package.json 稳得多。
+plugin_manifest_lines() {
+    local pdir="$1"
+    node -e '
+      const fs = require("fs"), path = require("path");
+      const dir = process.argv[1];
+      let pkg;
+      try { pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")); }
+      catch (e) { process.exit(2); }
+      for (const n of Object.keys(pkg.dependencies || {})) {
+        let ver = "?", declared = "";
+        try {
+          const m = JSON.parse(fs.readFileSync(path.join(dir, "node_modules", n, "package.json"), "utf8"));
+          ver = m.version || "?";
+          const c = (m.dsh || {}).compatibility;
+          if (c && c.dsh) declared = c.dsh;
+        } catch (e) { ver = "(未安装)"; }
+        console.log("plugin=" + n + "@" + ver);
+        if (declared) console.log("declared=" + n + " " + declared);
+      }
+      for (const b of (((pkg.dsh || {}).profile || {}).bundles || [])) console.log("bundle=" + b);
+    ' "$pdir" 2>/dev/null
+}
+
+# ========== 插件清单导出（菜单 8 → 第 3 种备份） ==========
+# 只记"装了什么、什么版本"，不搬插件代码。原因：
+#   · 插件代码是 registry 上可重新下载的派生品，不是不可替代的数据；
+#   · 跨 DSH 版本恢复旧插件代码，正是"插件忽然跑不起来"的成因
+#     ——插件用 dsh.compatibility / peerDependencies 声明了兼容范围。
+# 行式文本而非 JSON：读写都不依赖 jq / python3，人也能直接看、直接抄命令。
+backup_plugin_manifest() {
+    local out="$1"
+    local profile
+    profile=$(get_current_profile)
+    local pdir="$HOME/.dsh/profiles/$profile"
+
+    if [ ! -f "$pdir/package.json" ]; then
+        err "找不到 $pdir/package.json，无法导出插件清单"
+        return 1
+    fi
+    if ! command -v node >/dev/null 2>&1; then
+        err "需要 node 才能读取插件清单"
+        return 1
+    fi
+
+    local lines
+    lines=$(plugin_manifest_lines "$pdir")
+    if [ -z "$lines" ]; then
+        err "没能读出任何插件信息（profile：$profile）"
+        return 1
+    fi
+
+    {
+        echo "# DSH 插件清单 —— 由 dsh-manager 生成（不含插件代码）"
+        echo "# 恢复：主菜单 8 → 2，选中本文件，会按清单逐个重装"
+        echo "# 手动：dsh plugin --profile $profile add <名称>@<版本>"
+        echo "manifest=dsh-manager-plugin-manifest v1"
+        echo "profile=$profile"
+        echo "dsh_version=$(get_dsh_version 2>/dev/null)"
+        echo "created=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo
+        echo "# 已安装插件（名称@精确版本）"
+        printf '%s\n' "$lines" | grep '^plugin='
+        echo
+        echo "# 各插件声明的 DSH 兼容范围（- 表示没声明）"
+        printf '%s\n' "$lines" | grep '^declared=' || echo "# (无)"
+        echo
+        echo "# profile 装载的 bundle 顺序"
+        printf '%s\n' "$lines" | grep '^bundle='
+        echo
+        echo "# 你自己的补丁层 cordis.patch.yml（非空时才需要恢复）"
+        echo "patch_begin"
+        [ -f "$pdir/cordis.patch.yml" ] && cat "$pdir/cordis.patch.yml"
+        echo "patch_end"
+    } > "$out" || { err "写入清单失败"; return 1; }
+
+    [ -s "$out" ] || { err "清单为空"; return 1; }
+    return 0
+}
+
+# ========== 插件清单恢复 ==========
+restore_plugin_manifest() {
+    local file="$1"
+
+    # 解析：只认我们自己写的键值行，未知行忽略
+    local profile
+    profile=$(grep -m1 '^profile=' "$file" 2>/dev/null | cut -d= -f2)
+    profile="${profile:-$(get_current_profile)}"
+    local saved_dsh
+    saved_dsh=$(grep -m1 '^dsh_version=' "$file" 2>/dev/null | cut -d= -f2)
+    local cur_dsh
+    cur_dsh=$(get_dsh_version 2>/dev/null)
+
+    local -a names=() vers=()
+    local line entry
+    while IFS= read -r line; do
+        case "$line" in
+            plugin=*)
+                entry="${line#plugin=}"
+                names+=("${entry%@*}")
+                vers+=("${entry##*@}")
+                ;;
+        esac
+    done < "$file"
+
+    if [ ${#names[@]} -eq 0 ]; then
+        err "清单里没有插件记录"
+        return 1
+    fi
+
+    title "按插件清单恢复"
+    echo "清单文件：$(basename "$file")"
+    echo "目标 profile：$profile"
+    echo "清单生成时的 DSH：${saved_dsh:-未知}    当前 DSH：${cur_dsh:-未知}"
+    if [ -n "$saved_dsh" ] && [ -n "$cur_dsh" ] && [ "$saved_dsh" != "$cur_dsh" ]; then
+        warn "DSH 版本已经变了，按原版本重装的插件未必适配当前版本"
+    fi
+    echo
+    echo "将要安装："
+    local i
+    for i in "${!names[@]}"; do
+        printf "  %2d. %s@%s\n" "$((i+1))" "${names[$i]}" "${vers[$i]}"
+    done
+    echo
+    echo "声明过兼容范围的插件（仅供参考，不影响安装）："
+    grep '^declared=' "$file" 2>/dev/null | sed 's/^declared=/  /' || true
+    echo
+    echo "安装方式：dsh plugin --profile $profile add <名称>@<版本>"
+    echo "需要联网（registry 见 ~/.npmrc）"
+    echo
+    read -r -p "确认开始安装？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "操作已取消"
+        return 0
+    fi
+
+    local DSH_BIN_REAL
+    DSH_BIN_REAL=$(dsh_cmd)
+    local okn=0 badn=0
+    for i in "${!names[@]}"; do
+        echo
+        echo "--- [$((i+1))/${#names[@]}] ${names[$i]}@${vers[$i]}"
+        if "$DSH_BIN_REAL" plugin --profile "$profile" add "${names[$i]}@${vers[$i]}"; then
+            okn=$((okn + 1))
+        else
+            badn=$((badn + 1))
+            warn "安装失败：${names[$i]}@${vers[$i]}（可能已下架或版本不存在）"
+        fi
+    done
+
+    echo
+    info "完成：成功 $okn 个，失败 $badn 个"
+
+    # 恢复用户补丁层（仅当备份里非空）
+    local pdir="$HOME/.dsh/profiles/$profile"
+    local patch
+    patch=$(sed -n '/^patch_begin$/,/^patch_end$/p' "$file" 2>/dev/null | sed '1d;$d')
+    if [ -n "$patch" ]; then
+        echo
+        echo "清单里带有 cordis.patch.yml 内容："
+        printf '%s\n' "$patch" | sed 's/^/  /'
+        echo
+        read -r -p "写回 $pdir/cordis.patch.yml？(y/N): " CONFIRM || CONFIRM=""
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            printf '%s\n' "$patch" > "$pdir/cordis.patch.yml" \
+                && info "已写回 cordis.patch.yml" \
+                || err "写入失败"
+        fi
+    fi
+
+    echo
+    echo "提示：插件装完需要重启 DSH 服务生效（主菜单 4）。"
+    [ "$badn" -gt 0 ] && return 1
+    return 0
+}
+
 # 备份 DSH 数据
 backup_sessions() {
     title "备份 DSH 数据"
@@ -1557,8 +1761,9 @@ backup_sessions() {
     fi
     
     echo "选择备份类型："
-    echo "1. 仅对话记录（最小）- sessions/"
-    echo "2. 完整备份（推荐）- 含插件与附件"
+    echo "1. 仅对话记录（最小）"
+    echo "2. 完整备份（数据，不含插件）"
+    echo "3. 插件清单（只记名称与版本）"
     echo "0. 取消"
     read -r -p "请选择： " BACKUP_TYPE
 
@@ -1583,21 +1788,22 @@ backup_sessions() {
             cleanup_animation
             ;;
         2)
-            # ---------- 完整备份 ----------
-            # 整个 ~/.dsh 一把打包：插件、设置、凭据、附件、集成配置全在内，
-            # 比逐项列举更不容易漏（漏掉的项恢复时才会发现，代价很大）。
+            # ---------- 完整备份（数据） ----------
+            # 一把打包 ~/.dsh 的"数据"，但排除 profiles/：
+            # 插件代码是可重新下载的派生品，且跨 DSH 版本恢复旧插件
+            # 正是"插件跑不起来"的成因（见插件清单那一档的说明）。
             backup_file=$(generate_backup_filename "dsh_full_backup")
 
             echo
-            echo "正在执行完整备份..."
+            echo "正在执行完整备份（数据）..."
             echo "备份内容："
             echo "- 对话记录 (sessions/)"
             echo "- 工作区配置 (storages/)"
-            echo "- 插件本体与配置 (profiles/，含 node_modules)"
             echo "- 附件 (attachments/)"
             echo "- 设置、登录凭据、集成与模型配置"
             echo
-            echo "排除：backups/、cache/、telemetry/"
+            echo "不含插件（profiles/）；插件请用第 3 种「插件清单」备份"
+            echo "排除：profiles/、backups/、cache/、telemetry/"
             echo
 
             start_backup_animation "正在创建完整备份"
@@ -1608,6 +1814,7 @@ backup_sessions() {
             # 同名目录（与 rsync --exclude='.cache' 一致）；写成
             # .dsh/profiles/*/.cache 反而只能匹配一层深，深层排除不掉。
             tar -czf "$backup_file" -C "$HOME" \
+                --exclude='.dsh/profiles' \
                 --exclude='.dsh/backups' \
                 --exclude='.dsh/cache' \
                 --exclude='.dsh/telemetry' \
@@ -1615,8 +1822,27 @@ backup_sessions() {
                 .dsh 2>/dev/null
             cleanup_animation
             ;;
+        3)
+            # ---------- 插件清单 ----------
+            backup_file="${BACKUP_DIR}/dsh_plugins_backup_$(date +%Y%m%d_%H%M%S).list"
 
+            echo
+            echo "正在导出插件清单（只记名称与版本，不含插件代码）..."
+            echo "内容包括："
+            echo "- 每个插件的名称与精确版本"
+            echo "- 各插件声明的 DSH 兼容范围"
+            echo "- profile 装载顺序（bundles）"
+            echo "- 你的 cordis.patch.yml 补丁层"
+            echo
+            echo "为什么不含插件代码：插件代码在 registry 上可重新下载，"
+            echo "而跨 DSH 版本搬回旧插件，正是插件跑不起来的主因。"
+            echo
 
+            if ! backup_plugin_manifest "$backup_file"; then
+                rm -f "$backup_file"
+                return 1
+            fi
+            ;;
         0)
             warn "操作已取消"
             return 0
@@ -1627,22 +1853,32 @@ backup_sessions() {
             ;;
     esac
     
-    if [ -f "$backup_file" ]; then
-        # 验证备份文件完整性
-        if ! verify_backup "$backup_file"; then
-            err "备份文件验证失败"
-            return 1
-        fi
-
-        info "备份成功"
-        echo "类型：$(backup_kind "$backup_file")"
-        echo "文件：$(basename "$backup_file")"
-        echo "大小：$(du -h "$backup_file" | cut -f1)"
-        echo "会话：$(find "$dsh_dir/sessions" -name '*.jsonl.zstd' 2>/dev/null | wc -l) 个"
-    else
+    if [ ! -f "$backup_file" ]; then
         err "备份失败"
         return 1
     fi
+
+    if is_plugin_manifest "$backup_file"; then
+        info "插件清单已导出"
+        echo "文件：$(basename "$backup_file")"
+        echo "大小：$(du -h "$backup_file" | cut -f1)"
+        echo "插件：$(grep -c '^plugin=' "$backup_file" 2>/dev/null) 个"
+        echo
+        echo "恢复方式：主菜单 8 → 2，选中这个清单文件"
+        return 0
+    fi
+
+    # 数据归档才需要验证完整性
+    if ! verify_backup "$backup_file"; then
+        err "备份文件验证失败"
+        return 1
+    fi
+
+    info "备份成功"
+    echo "类型：$(backup_kind "$backup_file")"
+    echo "文件：$(basename "$backup_file")"
+    echo "大小：$(du -h "$backup_file" | cut -f1)"
+    echo "会话：$(find "$dsh_dir/sessions" -name '*.jsonl.zstd' 2>/dev/null | wc -l) 个"
 }
 
 # 恢复 DSH 数据
@@ -1658,7 +1894,7 @@ restore_sessions() {
     # 列出可用的备份文件
     echo "可用的备份文件："
     echo
-    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "($BACKUP_PREFIXES)" | sort -r))
+    local backup_files=($(list_backups))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -1686,7 +1922,13 @@ restore_sessions() {
     
     local selected_file="${backup_files[$((choice-1))]}"
     local filename=$(basename "$selected_file")
-    
+
+    # 插件清单不是归档，走"按清单重装"的另一条路
+    if is_plugin_manifest "$selected_file"; then
+        restore_plugin_manifest "$selected_file"
+        return $?
+    fi
+
     # 验证备份文件完整性
     if ! verify_backup "$selected_file"; then
         err "备份文件验证失败，无法恢复"
@@ -1700,7 +1942,8 @@ restore_sessions() {
     echo "恢复内容："
     echo "- 会话数据 (sessions/) - 您的对话历史"
     echo "- 工作区配置 (storages/) - 工作区设置"
-    echo "- 插件配置和设置文件"
+    echo "- 设置、附件、集成配置"
+    echo "（不含插件；插件请用「插件清单」备份恢复）"
     echo
     echo "重要提示："
     echo "1. 建议在恢复前停止 DSH 服务：systemctl stop dsh-web"
@@ -1863,7 +2106,7 @@ backup_management() {
     fi
     
     # 列出所有备份文件
-    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "($BACKUP_PREFIXES)" | sort -r))
+    local backup_files=($(list_backups))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -2058,6 +2301,7 @@ clean_backups_all() {
     fi
     
     rm -f "$BACKUP_DIR"/dsh_dialogue_backup_*.tar.gz
+    rm -f "$BACKUP_DIR"/dsh_plugins_backup_*.list
     rm -f "$BACKUP_DIR"/dsh_data_backup_*.tar.gz
     rm -f "$BACKUP_DIR"/dsh_sessions_backup_*.tar.gz
     rm -f "$BACKUP_DIR"/dsh_full_backup_*.tar.gz
@@ -2078,7 +2322,7 @@ test_backup_restore() {
     fi
     
     # 列出可用的备份文件
-    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "($BACKUP_PREFIXES)" | sort -r))
+    local backup_files=($(list_backups | grep -v "\.list$"))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -2166,10 +2410,10 @@ backup_restore_management() {
         echo "=== 备份与恢复 ==="
         echo
         echo "操作："
-        echo "1. 备份 DSH 数据"
-        echo "2. 恢复 DSH 数据"
+        echo "1. 备份（会话 / 数据 / 插件清单）"
+        echo "2. 恢复（自动识别类型）"
         echo "3. 管理备份列表"
-        echo "4. 测试备份恢复"
+        echo "4. 测试备份恢复（仅数据归档）"
         echo "0. 返回"
         echo
         read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -2211,14 +2455,17 @@ backup_restore_management() {
 
 # 获取当前 profile
 get_current_profile() {
-    local profile="web"
-    if [ -d "$HOME/.dsh/profiles" ]; then
-        local profiles=$(ls -d "$HOME/.dsh/profiles"/*/ 2>/dev/null | xargs -n1 basename)
-        if [ -n "$profiles" ]; then
-            profile="web"
-        fi
+    # 优先 web（DSH 默认 profile），否则取第一个真实 profile 目录。
+    # profiles/node_modules 是链接堆、不是 profile，要排掉。
+    local p=""
+    if [ -d "$HOME/.dsh/profiles/web" ]; then
+        p="web"
+    else
+        p=$(ls -d "$HOME/.dsh/profiles"/*/ 2>/dev/null \
+            | xargs -n1 basename 2>/dev/null \
+            | grep -vx 'node_modules' | head -n1)
     fi
-    echo "$profile"
+    printf '%s\n' "${p:-web}"
 }
 
 # ========== 插件名解析 ==========
