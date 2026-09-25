@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -380,11 +380,16 @@ install_nodejs_npm() {
     return 1
 }
 
-# ========== 更新DSH函数（npm全局更新本体） ==========
 # ========== 安装 / 更新 DSH 程序本体（npm） ==========
 # npm install -g 同时覆盖"全新安装"和"升级到最新"两种情况，
 # 因此安装与更新合并为同一个入口，无需两个菜单项。
+#
+# 参数：--yes 表示调用方（如「快速开始」）已经列出改动清单并取得用户同意，
+# 此时不再二次确认。默认无论如何都要确认——绝不静默改动用户的系统。
 install_or_update_dsh() {
+    local ASSUME_YES=0
+    [ "${1:-}" = "--yes" ] && ASSUME_YES=1
+
     title "安装 / 更新 DSH 程序本体"
     
     # ---------- 前置依赖：npm 与 node ----------
@@ -431,15 +436,38 @@ install_or_update_dsh() {
     if [ -n "$latest_version" ]; then
         echo "最新版本：$latest_version"
     else
-        warn "无法获取版本信息（可能是网络或 npm 源问题），仍可继续安装"
+        warn "无法获取版本信息（可能是网络或 npm 源问题）"
     fi
     
-    # ---------- 已是最新时询问是否重装 ----------
+    # ---------- 确认 ----------
+    # 这里是最容易出事的地方：以前"发现有新版"就直接 npm install，
+    # 用户只是点了个入口就被升级了。现在一律先问。
     if [ $installed -eq 1 ] && [ -n "$latest_version" ] && [ "$current_version" = "$latest_version" ]; then
+        # 已是最新
+        if [ $ASSUME_YES -eq 1 ]; then
+            echo
+            info "已是最新版本（$current_version），无需改动"
+            return 0
+        fi
         echo
         warn "当前已是最新版本"
         local CONFIRM
         read -r -p "是否仍要重新安装？(y/N): " CONFIRM || CONFIRM=""
+        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+            warn "操作已取消"
+            return 0
+        fi
+    elif [ $ASSUME_YES -eq 0 ]; then
+        # 全新安装 / 升级
+        local CONFIRM
+        echo
+        if [ $installed -eq 1 ] && [ -n "$latest_version" ]; then
+            read -r -p "确认升级 DSH ${current_version} → ${latest_version}？(y/N): " CONFIRM || CONFIRM=""
+        elif [ $installed -eq 0 ] && [ -n "$latest_version" ]; then
+            read -r -p "确认安装 DSH ${latest_version}？(y/N): " CONFIRM || CONFIRM=""
+        else
+            read -r -p "确认执行 npm 安装 / 更新？(y/N): " CONFIRM || CONFIRM=""
+        fi
         if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
             warn "操作已取消"
             return 0
@@ -2856,25 +2884,106 @@ remove_alias_from_bashrc() {
 }
 
 # ========== 菜单 1：快速开始 ==========
-# 新手只需要记住这一个入口：把"从零到能打开面板"串成一条自动流程。
-# 每一步失败就停下并说明原因，不带着半成品继续往下跑。
+# 新手只需要记住这一个入口，但"自动"不等于"不打招呼"：
+#   阶段一 体检：只看不动，弄清每项现状
+#   阶段二 列清单：把将要发生的改动全部摆出来（含版本号）
+#   阶段三 一次确认：用户点头后才动手，取消则一个字节都不改
+#   阶段四 执行：严格按清单走，失败即停
 quick_start() {
     title "快速开始"
-    echo "将按顺序执行：Node.js 环境 → DSH 本体 → systemd 服务 → 启动并给出访问链接"
+    echo "先体检、再列出将要做的改动，确认后才动手。"
     echo
 
-    # ---------- [1/4] Node.js / npm ----------
-    echo "[1/4] Node.js / npm"
+    # ================= 阶段一：体检（只读） =================
+    local node_ok=0 dsh_ok=0 unit_ok=0 run_ok=0
+    local cur_ver="" latest_ver=""
+
     if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-        echo "      已就绪：node $(node --version 2>/dev/null)  npm $(npm --version 2>/dev/null)"
+        node_ok=1
+    fi
+    if check_dsh_installed; then
+        dsh_ok=1
+        cur_ver=$(get_dsh_version)
+    fi
+    [ -f "/etc/systemd/system/${SVC}.service" ] && unit_ok=1
+    if [ $unit_ok -eq 1 ] && is_run; then
+        run_ok=1
+    fi
+    # 只有 node 可用时才查得到 npm 上的版本
+    if [ $node_ok -eq 1 ]; then
+        latest_ver=$(npm view @deepseek-ai/dsh version 2>/dev/null)
+    fi
+
+    if [ $node_ok -eq 1 ]; then
+        echo "Node.js    已就绪  node $(node --version 2>/dev/null)  npm $(npm --version 2>/dev/null)"
     else
-        warn "缺少 Node.js / npm"
-        local CONFIRM
-        read -r -p "      现在安装？(y/N): " CONFIRM || CONFIRM=""
-        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-            warn "已取消，快速开始中止"
-            return 1
+        echo "Node.js    缺失"
+    fi
+    if [ $dsh_ok -eq 1 ]; then
+        echo "DSH 本体   已安装  $cur_ver"
+        [ -n "$latest_ver" ] && echo "            npm 最新  $latest_ver"
+    else
+        echo "DSH 本体   未安装"
+        [ -n "$latest_ver" ] && echo "            npm 最新  $latest_ver"
+    fi
+    if [ $unit_ok -eq 1 ]; then
+        echo "systemd    已存在  $SVC"
+    else
+        echo "systemd    未初始化"
+    fi
+    if [ $run_ok -eq 1 ]; then
+        echo "服务       运行中"
+    else
+        echo "服务       未运行"
+    fi
+    echo
+
+    # ================= 阶段二：列清单 =================
+    local -a PLAN=()
+    if [ $node_ok -eq 0 ]; then
+        PLAN+=("安装 Node.js 与 npm")
+    fi
+    if [ $dsh_ok -eq 0 ]; then
+        if [ -n "$latest_ver" ]; then
+            PLAN+=("安装 DSH 本体 ${latest_ver}")
+        else
+            PLAN+=("安装 DSH 本体（npm 上的最新版）")
         fi
+    elif [ -n "$latest_ver" ] && [ "$cur_ver" != "$latest_ver" ]; then
+        PLAN+=("升级 DSH 本体 ${cur_ver} → ${latest_ver}")
+    fi
+    if [ $unit_ok -eq 0 ]; then
+        PLAN+=("创建并启用 systemd 服务 ${SVC}")
+    fi
+    if [ $run_ok -eq 0 ]; then
+        PLAN+=("启动服务")
+    fi
+    PLAN+=("输出带 token 的访问链接")
+
+    # 拿不到 npm 版本时，绝不去猜"是否有新版"，也就不碰已装好的 DSH
+    if [ $dsh_ok -eq 1 ] && [ -z "$latest_ver" ]; then
+        warn "读不到 npm 上的最新版本，本次不动 DSH 本体（避免误升级）"
+        echo
+    fi
+
+    echo "将要执行："
+    local step
+    for step in "${PLAN[@]}"; do
+        echo "  · $step"
+    done
+    echo
+
+    # ================= 阶段三：一次确认 =================
+    read -r -p "确认执行以上改动？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "已取消，未做任何改动"
+        return 0
+    fi
+    echo
+
+    # ================= 阶段四：执行 =================
+    if [ $node_ok -eq 0 ]; then
+        echo "[1/4] 安装 Node.js 与 npm"
         install_nodejs_npm
         hash -r 2>/dev/null || true
         if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
@@ -2882,30 +2991,34 @@ quick_start() {
             echo "可稍后单独安装：主菜单 9 → 3"
             return 1
         fi
-    fi
-    echo
-
-    # ---------- [2/4] DSH 本体 ----------
-    echo "[2/4] DSH 本体"
-    if ! install_or_update_dsh; then
-        err "DSH 本体未就绪，快速开始中止"
-        return 1
-    fi
-    echo
-
-    # ---------- [3/4] systemd 服务 ----------
-    echo "[3/4] systemd 服务"
-    if [ -f "/etc/systemd/system/${SVC}.service" ]; then
-        echo "      服务已存在（$SVC），跳过初始化"
     else
+        echo "[1/4] Node.js / npm 已就绪，跳过"
+    fi
+    echo
+
+    if [ $dsh_ok -eq 0 ] || { [ -n "$latest_ver" ] && [ "$cur_ver" != "$latest_ver" ]; }; then
+        echo "[2/4] 安装 / 更新 DSH 本体"
+        # --yes：上面已经把改动列清楚并确认过了，这里不再二次询问
+        if ! install_or_update_dsh --yes; then
+            err "DSH 本体未就绪，快速开始中止"
+            return 1
+        fi
+    else
+        echo "[2/4] DSH 本体无需改动，跳过"
+    fi
+    echo
+
+    if [ $unit_ok -eq 0 ]; then
+        echo "[3/4] 初始化 systemd 服务"
         if ! init_systemd; then
             err "服务初始化失败，快速开始中止"
             return 1
         fi
+    else
+        echo "[3/4] systemd 服务已存在，跳过"
     fi
     echo
 
-    # ---------- [4/4] 启动 + 访问链接 ----------
     echo "[4/4] 启动服务并获取访问链接"
     if is_run; then
         echo "      服务已在运行"
