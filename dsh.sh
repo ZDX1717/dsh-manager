@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.6.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1460,6 +1460,80 @@ generate_backup_filename() {
     echo "$filename"
 }
 
+# ---------- 备份类型：前缀即类型，列表/清理都靠它区分 ----------
+# dialogue = 仅对话记录；data = 对话+插件+配置；full = 完整
+# sessions 是 1.5.3 以前的旧前缀（当时内容其实等于 data），保留兼容
+BACKUP_PREFIXES="dsh_dialogue_backup|dsh_data_backup|dsh_sessions_backup|dsh_full_backup"
+
+# 由文件名判断备份类型，给用户看的短标签
+backup_kind() {
+    case "$(basename "$1")" in
+        dsh_dialogue_backup*) echo "仅对话" ;;
+        dsh_data_backup*|dsh_sessions_backup*) echo "对话+插件" ;;
+        dsh_full_backup*)     echo "完整" ;;
+        *)                    echo "未知" ;;
+    esac
+}
+
+# 列出备份时统一用两行一条，避免超宽表格在窄终端折行
+print_backup_entry() {
+    local idx="$1" file="$2"
+    local filename filesize filedate
+    filename=$(basename "$file")
+    filesize=$(du -h "$file" 2>/dev/null | cut -f1)
+    # 精确到分钟，够用且短
+    filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
+    printf "[%s] %s  %s  %s\n" "$idx" "${filedate:-未知时间}" "$(backup_kind "$file")" "${filesize:-?}"
+    printf "    %s\n" "$filename"
+}
+
+# 把 ~/.dsh 下指定的顶层条目打包成 tar.gz
+# 用法：pack_dsh_backup <输出文件> <条目...>
+#   条目可写目录名（sessions）或文件名（settings.yaml），不存在的自动跳过
+pack_dsh_backup() {
+    local out="$1"; shift
+    local temp_dir
+    temp_dir=$(mktemp -d) || { err "无法创建临时目录"; return 1; }
+    mkdir -p "$temp_dir/.dsh" || { rm -rf "$temp_dir"; err "无法创建临时目录结构"; return 1; }
+
+    local item src dst
+    for item in "$@"; do
+        src="$HOME/.dsh/$item"
+        [ -e "$src" ] || continue
+        dst="$temp_dir/.dsh/$item"
+        mkdir -p "$(dirname "$dst")"
+        if [ -d "$src" ]; then
+            if command -v rsync >/dev/null 2>&1; then
+                rsync -a --exclude='.cache' "$src/" "$dst/" 2>/dev/null
+            else
+                mkdir -p "$dst"
+                tar -cf - -C "$src" --exclude='.cache' . 2>/dev/null \
+                    | tar -xf - -C "$dst" 2>/dev/null
+            fi
+        else
+            cp "$src" "$dst" 2>/dev/null
+        fi
+    done
+
+    tar -czf "$out" -C "$temp_dir" .dsh 2>/dev/null
+    local rc=$?
+    rm -rf "$temp_dir"
+    return $rc
+}
+
+# 备份时的点状进度动画（前台跑，结束由 cleanup_animation 收）
+start_backup_animation() {
+    echo -n "$1"
+    (
+        trap '' INT
+        while true; do
+            echo -n "."
+            sleep 1
+        done
+    ) &
+    ANIMATION_PID=$!
+}
+
 # 备份 DSH 数据
 backup_sessions() {
     title "备份 DSH 数据"
@@ -1483,186 +1557,82 @@ backup_sessions() {
     fi
     
     echo "选择备份类型："
-    echo "1. 最小备份（推荐）- 会话/插件/配置"
-    echo "2. 完整备份 - 以上 + 其他文件"
+    echo "1. 仅对话记录（最小）- sessions/"
+    echo "2. 对话+插件+配置 - 推荐"
+    echo "3. 完整备份 - 再加附件等"
     echo "0. 取消"
     read -r -p "请选择： " BACKUP_TYPE
-    
+
+    local backup_file=""
     case $BACKUP_TYPE in
         1)
-            # 最小备份
-            local backup_file=$(generate_backup_filename "dsh_sessions_backup")
-            
+            # ---------- 仅对话记录 ----------
+            backup_file=$(generate_backup_filename "dsh_dialogue_backup")
+
             echo
-            echo "正在执行最小备份..."
-            echo "备份内容（核心数据）："
-            echo "- 会话数据 (sessions/) - 存储所有对话记录"
-            echo "- 工作区配置 (storages/) - 存储工作区设置"
-            echo "- 插件配置 (profiles/ 下的配置文件)"
-            echo "- 设置文件 (settings.yaml)"
+            echo "正在执行最小备份（仅对话记录）..."
+            echo "备份内容："
+            echo "- 会话数据 (sessions/) - 全部对话记录"
             echo
-            echo "注意：此备份包含您的对话历史和工作区配置，"
-            echo "重装 DSH 后恢复这些文件即可保留所有数据。"
+            echo "注意：本备份不含插件和设置。"
+            echo "恢复到本机没问题（恢复只覆盖、不删除）；"
+            echo "换机器或重装后恢复请改用第 2 或第 3 种。"
             echo
-            
-            # 创建临时目录结构
-            local temp_dir=$(mktemp -d)
-            if [ ! -d "$temp_dir" ]; then
-                err "无法创建临时目录"
-                return 1
-            fi
-            
-            mkdir -p "$temp_dir/.dsh"
-            if [ $? -ne 0 ]; then
-                err "无法创建临时目录结构"
-                rm -rf "$temp_dir"
-                return 1
-            fi
-            
-            # 复制重要目录
-            echo "正在复制会话数据..."
-            if [ -d "$dsh_dir/sessions" ]; then
-                # 使用 rsync 或 tar 来确保文件完整性
-                if command -v rsync >/dev/null 2>&1; then
-                    rsync -a "$dsh_dir/sessions/" "$temp_dir/.dsh/sessions/" 2>/dev/null
-                else
-                    # 如果没有 rsync，使用 tar 管道来确保完整性
-                    tar -cf - -C "$dsh_dir" sessions | tar -xf - -C "$temp_dir/.dsh/" 2>/dev/null
-                fi
-                if [ $? -ne 0 ]; then
-                    warn "复制会话数据时出现警告"
-                fi
-            fi
-            
-            echo "正在复制工作区配置..."
-            if [ -d "$dsh_dir/storages" ]; then
-                if command -v rsync >/dev/null 2>&1; then
-                    rsync -a "$dsh_dir/storages/" "$temp_dir/.dsh/storages/" 2>/dev/null
-                else
-                    tar -cf - -C "$dsh_dir" storages | tar -xf - -C "$temp_dir/.dsh/" 2>/dev/null
-                fi
-                if [ $? -ne 0 ]; then
-                    warn "复制工作区配置时出现警告"
-                fi
-            fi
-            
-            echo "正在复制插件配置..."
-            if [ -d "$dsh_dir/profiles" ]; then
-                # 备份插件配置和依赖
-                mkdir -p "$temp_dir/.dsh/profiles"
-                for profile_dir in "$dsh_dir/profiles"/*/; do
-                    if [ -d "$profile_dir" ]; then
-                        local profile_name=$(basename "$profile_dir")
-                        mkdir -p "$temp_dir/.dsh/profiles/$profile_name"
-                        
-                        # 复制配置文件和 node_modules（插件本身）
-                        if command -v rsync >/dev/null 2>&1; then
-                            rsync -a --exclude='.cache' "$profile_dir/" "$temp_dir/.dsh/profiles/$profile_name/" 2>/dev/null
-                        else
-                            # 使用 tar 来复制配置和插件
-                            cd "$profile_dir" 2>/dev/null && tar -cf - --exclude='.cache' . | tar -xf - -C "$temp_dir/.dsh/profiles/$profile_name/" 2>/dev/null
-                            cd - >/dev/null 2>&1
-                        fi
-                    fi
-                done
-                
-                # 复制根目录的配置文件
-                if [ -f "$dsh_dir/profiles/package.json" ]; then
-                    cp "$dsh_dir/profiles/package.json" "$temp_dir/.dsh/profiles/" 2>/dev/null
-                fi
-                if [ -f "$dsh_dir/profiles/pnpm-workspace.yaml" ]; then
-                    cp "$dsh_dir/profiles/pnpm-workspace.yaml" "$temp_dir/.dsh/profiles/" 2>/dev/null
-                fi
-            fi
-            
-            echo "正在复制设置文件..."
-            if [ -f "$dsh_dir/settings.yaml" ]; then
-                cp "$dsh_dir/settings.yaml" "$temp_dir/.dsh/" 2>/dev/null
-                if [ $? -ne 0 ]; then
-                    warn "复制设置文件时出现警告"
-                fi
-            fi
-            
-            # 复制其他重要文件
-            echo "正在复制其他配置文件..."
-            for file in ".anonymous-user-id" ".credentials.yaml"; do
-                if [ -f "$dsh_dir/$file" ]; then
-                    cp "$dsh_dir/$file" "$temp_dir/.dsh/" 2>/dev/null
-                fi
-            done
-            
-            # 显示循环点状动画
-            echo -n "正在创建备份"
-            (
-                # 子shell中忽略INT信号，这样父shell可以杀死它
-                trap '' INT
-                while true; do
-                    echo -n "."
-                    sleep 1
-                done
-            ) &
-            ANIMATION_PID=$!
-            
-            # 执行备份
-            tar -czf "$backup_file" -C "$temp_dir" .dsh 2>/dev/null
-            local backup_result=$?
-            
-            # 停止动画
+
+            start_backup_animation "正在创建备份"
+            pack_dsh_backup "$backup_file" sessions
             cleanup_animation
-            
-            if [ $backup_result -eq 0 ]; then
-                printf " 完成\n"
-            else
-                printf " 失败\n"
-            fi
-            
-            # 清理临时目录
-            rm -rf "$temp_dir"
             ;;
         2)
-            # 完整备份
-            local backup_file=$(generate_backup_filename "dsh_full_backup")
-            
+            # ---------- 对话 + 插件 + 配置 ----------
+            backup_file=$(generate_backup_filename "dsh_data_backup")
+
+            echo
+            echo "正在执行备份（对话 + 插件 + 配置）..."
+            echo "备份内容："
+            echo "- 对话记录 (sessions/)"
+            echo "- 工作区配置 (storages/)"
+            echo "- 插件本体与配置 (profiles/，含 node_modules)"
+            echo "- 设置 (settings.yaml) 与登录凭据"
+            echo
+            echo "注意：含插件本体，体积较大（可能上百 MB）。"
+            echo "重装 DSH 后恢复即可保留全部数据与插件。"
+            echo
+
+            start_backup_animation "正在创建备份"
+            pack_dsh_backup "$backup_file" sessions storages profiles \
+                settings.yaml .anonymous-user-id .credentials.yaml
+            cleanup_animation
+            ;;
+        3)
+            # ---------- 完整备份 ----------
+            backup_file=$(generate_backup_filename "dsh_full_backup")
+
             echo
             echo "正在执行完整备份..."
             echo "备份内容："
-            echo "- 会话数据 (sessions/)"
-            echo "- 工作区配置 (storages/)"
-            echo "- 插件配置和插件本身 (profiles/)"
-            echo "- 设置文件 (settings.yaml)"
-            echo "- 其他配置文件"
+            echo "- 第 2 种的全部内容"
+            echo "- 附件 (attachments/)"
+            echo "- 集成与模型配置 (im/ integrations/ llm-*)"
             echo
-            
-            # 显示循环点状动画
-            echo -n "正在创建完整备份"
-            (
-                # 子shell中忽略INT信号，这样父shell可以杀死它
-                trap '' INT
-                while true; do
-                    echo -n "."
-                    sleep 1
-                done
-            ) &
-            ANIMATION_PID=$!
-            
-            # 执行备份（排除缓存和临时文件，但保留插件）
-            tar -czf "$backup_file" -C "$HOME" .dsh \
+            echo "排除：backups/、cache/、telemetry/"
+            echo
+
+            start_backup_animation "正在创建完整备份"
+            # 直接打包整个 ~/.dsh，比逐项复制更省事也更完整。
+            # 注意：GNU tar 的 --exclude 是位置相关的选项，必须写在操作数
+            # .dsh 之前，写在后面会被直接忽略。旧版就写在了后面，
+            # 结果 backups/（历次备份自身）和 cache/ 一直被塞进完整备份里。
+            tar -czf "$backup_file" -C "$HOME" \
                 --exclude='.dsh/backups' \
-                --exclude='.dsh/profiles/*/.cache' \
                 --exclude='.dsh/cache' \
                 --exclude='.dsh/telemetry' \
-                2>/dev/null
-            local backup_result=$?
-            
-            # 停止动画
+                --exclude='.dsh/profiles/*/.cache' \
+                .dsh 2>/dev/null
             cleanup_animation
-            
-            if [ $backup_result -eq 0 ]; then
-                printf " 完成\n"
-            else
-                printf " 失败\n"
-            fi
             ;;
+
+
         0)
             warn "操作已取消"
             return 0
@@ -1679,20 +1649,12 @@ backup_sessions() {
             err "备份文件验证失败"
             return 1
         fi
-        
-        local backup_size=$(du -h "$backup_file" | cut -f1)
+
         info "备份成功"
-        echo "备份文件：$backup_file"
-        echo "备份大小：$backup_size"
-        echo
-        echo "备份内容："
-        echo "- 会话目录：$(ls -1 "$dsh_dir/sessions/" 2>/dev/null | wc -l) 个工作区"
-        echo "- 会话文件：$(find "$dsh_dir/sessions/" -name "*.jsonl.zstd" 2>/dev/null | wc -l) 个会话"
-        echo "- 工作区配置：$(cat "$dsh_dir/storages/workspace.json" 2>/dev/null | grep -c "workspaceIds" || echo 0) 个工作区"
-        echo
-        echo "备份文件内容："
-        tar -tzf "$backup_file" 2>/dev/null | head -10
-        echo "..."
+        echo "类型：$(backup_kind "$backup_file")"
+        echo "文件：$(basename "$backup_file")"
+        echo "大小：$(du -h "$backup_file" | cut -f1)"
+        echo "会话：$(find "$dsh_dir/sessions" -name '*.jsonl.zstd' 2>/dev/null | wc -l) 个"
     else
         err "备份失败"
         return 1
@@ -1712,7 +1674,7 @@ restore_sessions() {
     # 列出可用的备份文件
     echo "可用的备份文件："
     echo
-    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "(dsh_sessions_backup|dsh_full_backup)" | sort -r))
+    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "($BACKUP_PREFIXES)" | sort -r))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -1720,11 +1682,7 @@ restore_sessions() {
     fi
     
     for i in "${!backup_files[@]}"; do
-        local file="${backup_files[$i]}"
-        local filename=$(basename "$file")
-        local filesize=$(du -h "$file" | cut -f1)
-        local filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d'.' -f1)
-        echo "$((i+1)). $filename ($filesize) - $filedate"
+        print_backup_entry "$((i+1))" "${backup_files[$i]}"
     done
     
     echo
@@ -1921,7 +1879,7 @@ backup_management() {
     fi
     
     # 列出所有备份文件
-    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "(dsh_sessions_backup|dsh_full_backup)" | sort -r))
+    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "($BACKUP_PREFIXES)" | sort -r))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -1930,15 +1888,11 @@ backup_management() {
     
     # 显示备份列表
     echo "=== 备份文件列表 ==="
-    printf "${BLD}%-5s %-40s %-10s %-20s${RST}\n" "序号" "文件名" "大小" "日期"
-    echo "----------------------------------------------------------------------"
-    
+    echo "格式：[序号] 日期时间  类型  大小"
+    echo
+
     for i in "${!backup_files[@]}"; do
-        local file="${backup_files[$i]}"
-        local filename=$(basename "$file")
-        local filesize=$(du -h "$file" | cut -f1)
-        local filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d'.' -f1)
-        printf "%-5s %-40s %-10s %-20s\n" "$((i+1))" "$filename" "$filesize" "$filedate"
+        print_backup_entry "$((i+1))" "${backup_files[$i]}"
     done
     
     echo
@@ -2119,6 +2073,8 @@ clean_backups_all() {
         return 0
     fi
     
+    rm -f "$BACKUP_DIR"/dsh_dialogue_backup_*.tar.gz
+    rm -f "$BACKUP_DIR"/dsh_data_backup_*.tar.gz
     rm -f "$BACKUP_DIR"/dsh_sessions_backup_*.tar.gz
     rm -f "$BACKUP_DIR"/dsh_full_backup_*.tar.gz
     
@@ -2138,7 +2094,7 @@ test_backup_restore() {
     fi
     
     # 列出可用的备份文件
-    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "(dsh_sessions_backup|dsh_full_backup)" | sort -r))
+    local backup_files=($(ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null | grep -E "($BACKUP_PREFIXES)" | sort -r))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -2148,10 +2104,7 @@ test_backup_restore() {
     echo "可用的备份文件："
     echo
     for i in "${!backup_files[@]}"; do
-        local file="${backup_files[$i]}"
-        local filename=$(basename "$file")
-        local filesize=$(du -h "$file" | cut -f1)
-        echo "$((i+1)). $filename ($filesize)"
+        print_backup_entry "$((i+1))" "${backup_files[$i]}"
     done
     
     echo
