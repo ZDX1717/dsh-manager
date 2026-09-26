@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.13.0"
+SCRIPT_VERSION="1.14.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1790,6 +1790,73 @@ ensure_pnpm() {
     return 1
 }
 
+# 生成不覆盖已有文件的备份名：同一秒里连续改两次也不会互相盖掉
+backup_file_unique() {
+    local src="$1" dst="${1}.bak-$(date +%Y%m%d_%H%M%S)" n=1
+    while [ -e "$dst" ]; do
+        dst="${1}.bak-$(date +%Y%m%d_%H%M%S)_${n}"
+        n=$((n + 1))
+    done
+    cp "$src" "$dst" 2>/dev/null && printf '%s\n' "$dst"
+}
+
+# ---------- profile 的 bundles（DSH 真正加载的包列表） ----------
+# profile/package.json 里有两份东西：
+#   dependencies  —— pnpm 装了什么（装完不等于会加载）
+#   dsh.profile.bundles —— DSH 按这个顺序加载，缺一个包就启动失败
+#     （cannot resolve profile bundle）。所以"启用/禁用"应当改 bundles，
+#     而不是去重命名 node_modules 目录。
+profile_manifest() {
+    printf '%s\n' "$HOME/.dsh/profiles/$1/package.json"
+}
+
+profile_bundles_has() {
+    local pj
+    pj=$(profile_manifest "$1")
+    [ -f "$pj" ] || return 1
+    node -e '
+      const fs = require("fs");
+      try {
+        const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        const b = (((d.dsh || {}).profile || {}).bundles) || [];
+        process.exit(b.includes(process.argv[2]) ? 0 : 1);
+      } catch (e) { process.exit(1); }
+    ' "$pj" "$2" 2>/dev/null
+}
+
+# 改 bundles：$1=profile $2=包名 $3=add|remove
+profile_bundles_edit() {
+    local pj
+    pj=$(profile_manifest "$1")
+    [ -f "$pj" ] || { err "找不到 $pj"; return 1; }
+    backup_file_unique "$pj" >/dev/null
+    node -e '
+      const fs = require("fs");
+      const [file, name, action] = process.argv.slice(1);
+      const d = JSON.parse(fs.readFileSync(file, "utf8"));
+      d.dsh = d.dsh || {};
+      d.dsh.profile = d.dsh.profile || {};
+      const b = (d.dsh.profile.bundles = d.dsh.profile.bundles || []);
+      if (action === "add") {
+        if (!b.includes(name)) b.push(name);
+      } else {
+        d.dsh.profile.bundles = b.filter((x) => x !== name);
+      }
+      fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
+    ' "$pj" "$2" "$3" 2>/dev/null || { err "写入失败"; return 1; }
+    return 0
+}
+
+# pnpm 11 留下的待放行条目（未编译的原生模块会让插件加载失败）
+pending_build_approvals() {
+    local f="$HOME/.dsh/profiles/$1/pnpm-workspace.yaml"
+    [ -f "$f" ] || return 0
+    grep 'set this to true or false' "$f" 2>/dev/null \
+        | sed 's/: *set this to true or false.*//' \
+        | sed "s/^[[:space:]]*//; s/^'//; s/'$//" \
+        | grep -v '^$' | paste -sd' ' -
+}
+
 # ---------- 依赖构建脚本放行 ----------
 # pnpm 11 起 strictDepBuilds 默认为真：没放行的依赖不许执行安装脚本，
 # 带原生模块的（sharp / node-pty 等）会直接装不上，并把它们写成
@@ -1810,7 +1877,7 @@ approve_ignored_builds() {
         echo "可手动执行：cd $(dirname "$f") && pnpm approve-builds"
         return 1
     fi
-    cp "$f" "$f.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null
+    backup_file_unique "$f" >/dev/null
     sed -i 's/: *set this to true or false *$/: true/' "$f"
     if grep -q 'set this to true or false' "$f"; then
         err "仍有未放行的条目，请手动执行 pnpm approve-builds"
@@ -2754,56 +2821,26 @@ plugin_name_of() {
     printf '%s\n' "$1" | sed 's/@[0-9][^@]*$//'
 }
 
-# ========== JSON 编辑能力检测 ==========# 删除插件必须同步修改 package.json 的 dsh.profile.bundles，
-# 否则 dependencies 已移除而 bundles 仍残留，DSH 启动会报
-# cannot resolve profile bundle。优先 jq，退化到 python3。
-json_tool() {
-    if command -v jq >/dev/null 2>&1; then
-        echo "jq"
-        return 0
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-        echo "python3"
-        return 0
-    fi
-    return 1
-}
-
-# 从 package.json 的 bundles 中移除指定包名
-# 返回 0=成功  1=失败  2=无可用工具
+# ========== 从 bundles 移除包 ==========
+# 删除插件必须同步修改 package.json 的 dsh.profile.bundles：
+# dependencies 移除了而 bundles 还留着，DSH 启动就报 cannot resolve profile bundle。
 remove_from_bundles() {
+    # 从当前目录的 package.json 里移除 bundles 条目。
+    # 用 node 解析 —— DSH 离不开 node，等于零额外依赖；
+    # 原来依赖 jq/python3，最小服务器上两个都没有时会把 bundles 留着，
+    # 于是 DSH 启动报 cannot resolve profile bundle。
     local pkg="$1"
-    local file="package.json"
-    local tmp tool
-    tmp=$(mktemp) || return 1
-    tool=$(json_tool) || { rm -f "$tmp"; return 2; }
-    
-    if [ "$tool" = "jq" ]; then
-        if jq --arg p "$pkg" '.dsh.profile.bundles |= map(select(. != $p))' "$file" > "$tmp" 2>/dev/null \
-            && [ -s "$tmp" ] && mv "$tmp" "$file" 2>/dev/null; then
-            return 0
-        fi
-        rm -f "$tmp"
-        return 1
-    fi
-    
-    # python3 兜底
-    if python3 -c '
-import json, sys
-src, dst, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(src, encoding="utf-8") as f:
-    data = json.load(f)
-bundles = data.get("dsh", {}).get("profile", {}).get("bundles")
-if isinstance(bundles, list):
-    data["dsh"]["profile"]["bundles"] = [x for x in bundles if x != pkg]
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-' "$file" "$tmp" "$pkg" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$file" 2>/dev/null; then
-        return 0
-    fi
-    rm -f "$tmp"
-    return 1
+    [ -f package.json ] || return 1
+    backup_file_unique package.json >/dev/null
+    node -e '
+      const fs = require("fs");
+      const [file, name] = process.argv.slice(1);
+      const d = JSON.parse(fs.readFileSync(file, "utf8"));
+      d.dsh = d.dsh || {};
+      d.dsh.profile = d.dsh.profile || {};
+      d.dsh.profile.bundles = (d.dsh.profile.bundles || []).filter((x) => x !== name);
+      fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
+    ' package.json "$pkg" 2>/dev/null
 }
 
 # 插件管理（整合所有插件功能）
@@ -2903,17 +2940,33 @@ plugin_menu_loop() {
             echo "已安装的插件："
             echo
             
+            # 待放行的构建脚本：包装上了，但原生模块没编译，插件可能加载失败
+            local pending
+            pending=$(pending_build_approvals "$profile")
+            if [ -n "$pending" ]; then
+                warn "有依赖的构建脚本未放行：$pending"
+                echo "      它们的原生模块没编译，相关插件可能加载失败。"
+                echo "      处理：本菜单选 1 重新安装（会问你是否放行），"
+                echo "      或进入 profile 目录执行 pnpm approve-builds。"
+                echo
+            fi
+
             # 使用数组存储插件列表
             local plugins=()
             local index=1
             while IFS= read -r plugin; do
                 if [ -n "$plugin" ]; then
                     plugins+=("$plugin")
-                    # 检查插件状态（检查是否在 node_modules 中存在）
+                    # 状态要分两件事看：包装没装上（node_modules）、
+                    # 以及 DSH 会不会加载它（dsh.profile.bundles）。
                     local plugin_name=$(plugin_name_of "$plugin")
-                    local status="✅ 已启用"
+                    local status
                     if [ ! -d "node_modules/$plugin_name" ]; then
-                        status="❌ 已禁用"
+                        status="❌ 未安装"
+                    elif profile_bundles_has "$profile" "$plugin_name"; then
+                        status="✅ 已启用"
+                    else
+                        status="⚠️  已安装未启用"
                     fi
                     echo "$index. $plugin - $status"
                     index=$((index + 1))
@@ -2973,19 +3026,23 @@ plugin_menu_loop() {
                         local plugin_short_name=$(plugin_name_of "$plugin_name")
                         echo "启用插件：$plugin_short_name"
                         
-                        # 检查是否被禁用（重命名了）
-                        if [ -d "node_modules/${plugin_short_name}.disabled" ]; then
-                            mv "node_modules/${plugin_short_name}.disabled" "node_modules/$plugin_short_name" 2>/dev/null
-                            if [ $? -eq 0 ]; then
-                                info "插件已启用：$plugin_short_name"
-                                echo "提示：可能需要重启 DSH 服务"
-                            else
-                                err "启用失败"
-                            fi
-                        elif [ -d "node_modules/$plugin_short_name" ]; then
+                        if [ ! -d "node_modules/$plugin_short_name" ] && \
+                           [ -d "node_modules/${plugin_short_name}.disabled" ]; then
+                            # 兼容早期用"重命名目录"禁用的插件
+                            mv "node_modules/${plugin_short_name}.disabled" \
+                               "node_modules/$plugin_short_name" 2>/dev/null
+                        fi
+
+                        if [ ! -d "node_modules/$plugin_short_name" ]; then
+                            err "插件没装（node_modules 里没有它），请先用 1 安装"
+                        elif profile_bundles_has "$profile" "$plugin_short_name"; then
                             warn "插件已经是启用状态"
+                        elif profile_bundles_edit "$profile" "$plugin_short_name" add; then
+                            info "插件已启用：$plugin_short_name"
+                            echo "已加入 DSH 的加载列表（dsh.profile.bundles）"
+                            echo "提示：需要重启 DSH 服务才会生效"
                         else
-                            err "插件不存在"
+                            err "启用失败"
                         fi
                     else
                         err "无效的插件序号"
@@ -3000,19 +3057,14 @@ plugin_menu_loop() {
                         local plugin_short_name=$(plugin_name_of "$plugin_name")
                         echo "禁用插件：$plugin_short_name"
                         
-                        # 检查是否已启用
-                        if [ -d "node_modules/$plugin_short_name" ]; then
-                            mv "node_modules/$plugin_short_name" "node_modules/${plugin_short_name}.disabled" 2>/dev/null
-                            if [ $? -eq 0 ]; then
-                                info "插件已禁用：$plugin_short_name"
-                                echo "提示：可能需要重启 DSH 服务"
-                            else
-                                err "禁用失败"
-                            fi
-                        elif [ -d "node_modules/${plugin_short_name}.disabled" ]; then
+                        if ! profile_bundles_has "$profile" "$plugin_short_name"; then
                             warn "插件已经是禁用状态"
+                        elif profile_bundles_edit "$profile" "$plugin_short_name" remove; then
+                            info "插件已禁用：$plugin_short_name"
+                            echo "已从 DSH 的加载列表移除；包仍在 node_modules 里，随时可再启用"
+                            echo "提示：需要重启 DSH 服务才会生效"
                         else
-                            err "插件不存在"
+                            err "禁用失败"
                         fi
                     else
                         err "无效的插件序号"
@@ -3054,16 +3106,13 @@ plugin_menu_loop() {
                     read -r CONFIRM
                     
                     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-                        # 先确认有 JSON 编辑工具。没有工具就绝不能动插件：
-                        # pnpm remove 会清掉 dependencies，而 bundles 改不了，
-                        # 结果是 DSH 启动时报 cannot resolve profile bundle。
-                        if ! json_tool >/dev/null 2>&1; then
-                            err "缺少 jq 或 python3，无法安全删除插件"
-                            echo "  删除插件必须同步更新 package.json 的 bundles，"
-                            echo "  否则 DSH 下次启动会报 cannot resolve profile bundle。"
-                            echo "  请先安装其一后重试："
-                            echo "    apt install -y jq        # Debian/Ubuntu"
-                            echo "    dnf install -y jq        # Fedora/RHEL"
+                        # 删除会同时改 dependencies 和 bundles，必须两者都成功：
+                        # bundles 改不掉、包却没了，DSH 下次启动就报
+                        # cannot resolve profile bundle。现在用 node 解析，
+                        # DSH 离不开 node，所以不再依赖 jq / python3。
+                        if ! command -v node >/dev/null 2>&1; then
+                            err "缺少 node，无法安全删除插件"
+                            echo "  删除插件必须同步更新 package.json 的 bundles。"
                             continue
                         fi
                         

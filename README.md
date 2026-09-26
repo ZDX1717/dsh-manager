@@ -73,7 +73,7 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.13.0 ====
+==== DSH-Web 管理面板 v1.14.0 ====
 
 DSH   0.1.5-rc.2
 服务  dsh-web  运行中
@@ -134,6 +134,30 @@ DSH   0.1.5-rc.2
 而且每个插件都用 `dsh.compatibility` / `peerDependencies` 声明了它支持的 DSH 版本范围，
 把旧插件代码整包恢复到新 DSH 上，正是"插件忽然跑不起来"的主因
 （典型表现是启动时报 `cannot resolve profile bundle`）。
+
+## 插件管理里"启用"到底指什么（主菜单 7）
+
+profile 的 `package.json` 里有两份不同的东西：
+
+| 字段 | 含义 |
+|---|---|
+| `dependencies` | pnpm 装了什么。**装上了不等于会被加载** |
+| `dsh.profile.bundles` | DSH 实际加载的包与顺序。**列表里有、包却不在，DSH 直接启动失败**（`cannot resolve profile bundle`） |
+
+所以插件列表的状态分三档：
+
+```
+1. dsh-cost-meter@1.7.37 - ✅ 已启用            （装着，且在 bundles 里）
+2. dsh-better-sidebar@0.19.1 - ⚠️  已安装未启用  （装着，但不在 bundles 里，DSH 不加载）
+3. dsh-x@1.0.0 - ❌ 未安装                      （bundles/依赖里声明了，但 node_modules 里没有）
+```
+
+- `启用` = 加入 `dsh.profile.bundles`；`禁用` = 从里面移除（包留在 `node_modules`，随时可再启用）。
+  改动前会把 `package.json` 另存为 `.bak-<时间>`，改完需重启 DSH。
+- 早期版本用"把 `node_modules/<包>` 改名成 `.disabled`"来禁用，那是错的：
+  bundles 里还留着，DSH 会找不到包而启动失败。旧目录会被自动改回来。
+- **pnpm 11 的构建脚本拦截**会出现在列表顶部提醒：包已链进 `node_modules`，
+  但原生模块没编译，插件可能加载失败。按提示重新安装（会问你是否放行）即可。
 
 ## 备份插件列表（主菜单 7 → 5）
 
