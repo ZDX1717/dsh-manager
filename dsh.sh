@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.18.3"
+SCRIPT_VERSION="1.18.4"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -4516,6 +4516,13 @@ alias_menu() {
     done
 }
 
+# 菜单分割线：宽度与标题显示宽度严格一致（标题里只有版本号长度会变）。
+# 28 = "==== " + "DSH-Web " + "管理面板" + " v" + " ====" 的显示宽度，
+# 中文按双宽算，所以直接用 28 + 版本号字符数，版本号变长也不会错位。
+menu_rule() {
+    printf '%*s\n' "$((28 + ${#SCRIPT_VERSION}))" '' | tr ' ' '-'
+}
+
 # ========== 菜单 ==========
 # 排版约束：每一行都要能在 50 列的窄终端里不换行。
 #   · 选项一律不带说明文字——窄终端下注释正是换行的元凶；
@@ -4525,6 +4532,7 @@ menu() {
     clear 2>/dev/null
 
     printf "${BLD}==== DSH-Web 管理面板 v%s ====${RST}\n" "$SCRIPT_VERSION"
+    menu_rule
 
     # ---------- 状态模块：紧跟标题 ----------
     local DSH_TXT DSH_COLOR DSH_TAG
@@ -4560,9 +4568,9 @@ menu() {
     else
         printf "端口  %s\n" "$DSH_PORT"
     fi
-    echo "------------------------------"
+    menu_rule
     echo "命令行输入 d 可快速启动脚本"
-    echo "------------------------------"
+    menu_rule
 
     # ---------- 选项区：不带说明文字 ----------
     echo " 1. 快速开始"
@@ -4575,11 +4583,11 @@ menu() {
     echo " 8. 备份与恢复"
     echo " 9. 维护工具"
     echo "10. 卸载"
-    echo "------------------------------"
+    menu_rule
     echo "00. 更新管理脚本"
-    echo "------------------------------"
+    menu_rule
     echo " 0. 退出脚本"
-    echo "------------------------------"
+    menu_rule
     printf "请输入选项："
 }
 
