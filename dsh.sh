@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1537,9 +1537,28 @@ start_backup_animation() {
 
 # ---------- 备份清单的枚举与识别 ----------
 # 数据备份是 .tar.gz 目录归档，插件清单是 .list 文本；统一在这里按前缀过滤
+# 按修改时间倒序（新的在前）。不能用 sort -r 排文件名：
+# 不同前缀的第一个字母不同，排出来"最近一次"会是错的。
 list_backups() {
-    ls -1 "$BACKUP_DIR"/*.tar.gz "$BACKUP_DIR"/*.list 2>/dev/null \
-        | grep -E "($BACKUP_PREFIXES)" | sort -r
+    ls -1t "$BACKUP_DIR"/*.tar.gz "$BACKUP_DIR"/*.list 2>/dev/null \
+        | grep -E "($BACKUP_PREFIXES)"
+}
+
+# 备份现状摘要，供菜单和备份类型屏复用
+# 输出三行：数量体积 / 最近一次（时间 类型）
+backup_status_lines() {
+    local files=($(list_backups))
+    if [ ${#files[@]} -eq 0 ]; then
+        printf '还没有备份\n—\n'
+        return 0
+    fi
+    local size
+    size=$(du -ch "${files[@]}" 2>/dev/null | tail -n1 | cut -f1)
+    printf '%s 个备份（共 %s）\n' "${#files[@]}" "${size:-?}"
+    local newest="${files[0]}"
+    local when
+    when=$(stat -c %y "$newest" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
+    printf '%s  %s\n' "${when:-未知时间}" "$(backup_kind "$newest")"
 }
 
 is_plugin_manifest() {
@@ -1760,10 +1779,15 @@ backup_sessions() {
         return 1
     fi
     
+    # 先给现状，帮用户决定这次备哪种
+    local status
+    status=$(backup_status_lines)
+    printf '上次备份：%s\n' "$(printf '%s\n' "$status" | sed -n '2p')"
+    echo
     echo "选择备份类型："
-    echo "1. 仅对话记录（最小）"
-    echo "2. 完整备份（数据，不含插件）"
-    echo "3. 插件清单（只记名称与版本）"
+    echo "1. 仅对话记录"
+    echo "2. 完整备份（不含插件）"
+    echo "3. 插件清单"
     echo "0. 取消"
     read -r -p "请选择： " BACKUP_TYPE
 
@@ -1892,7 +1916,7 @@ restore_sessions() {
     fi
     
     # 列出可用的备份文件
-    echo "可用的备份文件："
+    echo "可恢复的备份："
     echo
     local backup_files=($(list_backups))
     
@@ -2329,7 +2353,7 @@ test_backup_restore() {
         return 1
     fi
     
-    echo "可用的备份文件："
+    echo "可恢复的备份："
     echo
     for i in "${!backup_files[@]}"; do
         print_backup_entry "$((i+1))" "${backup_files[$i]}"
@@ -2409,11 +2433,17 @@ backup_restore_management() {
         clear 2>/dev/null
         echo "=== 备份与恢复 ==="
         echo
-        echo "操作："
-        echo "1. 备份（会话 / 数据 / 插件清单）"
-        echo "2. 恢复（自动识别类型）"
-        echo "3. 管理备份列表"
-        echo "4. 测试备份恢复（仅数据归档）"
+        # 状态区：进来先看见"我备过没有"
+        local status
+        status=$(backup_status_lines)
+        echo "目录   $BACKUP_DIR"
+        printf '已有   %s\n' "$(printf '%s\n' "$status" | sed -n '1p')"
+        printf '上次   %s\n' "$(printf '%s\n' "$status" | sed -n '2p')"
+        echo
+        echo "1. 新建备份"
+        echo "2. 恢复备份"
+        echo "3. 管理备份文件"
+        echo "4. 测试备份恢复"
         echo "0. 返回"
         echo
         read -r -p "请选择操作： " choice || { echo; return 0; }
