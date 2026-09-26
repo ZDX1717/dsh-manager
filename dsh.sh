@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.18.2"
+SCRIPT_VERSION="1.18.3"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -4553,12 +4553,14 @@ menu() {
     fi
 
     printf "DSH   ${DSH_COLOR}%s  %s${RST}\n" "$DSH_TXT" "$DSH_TAG"
+    printf "服务  ${STATE_COLOR}%s  %s${RST}\n" "$SVC" "$STATE_TAG"
+    # PID 跟着端口走（只有运行中才有值）
     if [ -n "$PID_TXT" ] && [ "$PID_TXT" != "0" ]; then
-        printf "服务  ${STATE_COLOR}%s  %s PID %s${RST}\n" "$SVC" "$STATE_TAG" "$PID_TXT"
+        printf "端口  %s  PID %s\n" "$DSH_PORT" "$PID_TXT"
     else
-        printf "服务  ${STATE_COLOR}%s  %s${RST}\n" "$SVC" "$STATE_TAG"
+        printf "端口  %s\n" "$DSH_PORT"
     fi
-    printf "端口  %s\n" "$DSH_PORT"
+    echo "------------------------------"
     echo "命令行输入 d 可快速启动脚本"
     echo "------------------------------"
 
