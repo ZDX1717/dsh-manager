@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.1"
+SCRIPT_VERSION="1.19.2"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1806,6 +1806,7 @@ backup_group_name() {
         dsh_full_backup*)                      echo "完整备份" ;;
         dsh_dialogue_backup*)                  echo "仅对话记录" ;;
         dsh_plugins_backup*)                   echo "插件清单" ;;
+        dsh_prerestore*)                       echo "恢复前快照" ;;
         *)                                     echo "其他" ;;
     esac
 }
