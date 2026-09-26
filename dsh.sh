@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.17.1"
+SCRIPT_VERSION="1.18.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -4524,62 +4524,75 @@ alias_menu() {
 menu() {
     clear 2>/dev/null
 
-    printf "${BLD}==== DSH-Web 管理面板 v%s ====${RST}\n" "$SCRIPT_VERSION"
-    echo
+    # ---------- 标题区 ----------
+    # 排版借鉴常见的工具箱面板：ASCII 字标 + 版本 + 快捷命令提示 + 分隔线。
+    # 宽度上限 70 列；选项名与同行说明之间手工对齐（已按 CJK 双宽计算）。
+    printf "${BLD}╔╦╗ ╔═╗ ╦ ╦     ╦ ╦ ╔═╗ ╔╦╗${RST}\n"
+    printf "${BLD}║║║ ╚═╗ ╠═╣ ─── ║║║ ╠═╣ ╠╩╗${RST}\n"
+    printf "${BLD}╚╩╝ ╚═╝ ╩ ╩     ╚╩╝ ╚═╝ ╚═╝${RST}\n"
+    printf "${BLD}DSH-Web 管理面板 v%s${RST}\n" "$SCRIPT_VERSION"
+    echo "命令行输入 d 可快速启动（没配置过就 9 → 2 添加）"
+    echo "------------------------------"
 
-    # ---- 状态区：每行都短 ----
-    local DSH_TXT="" DSH_COLOR="$GRN"
+    # ---------- 选项区：说明与选项同行，对齐到第 26 列 ----------
+    printf " 1. 快速开始               ${DIM}体检 → 装 DSH → 起服务 → 给链接${RST}\n"
+    echo " 2. 启动服务"
+    echo " 3. 停止服务"
+    echo " 4. 重启服务"
+    printf " 5. 获取 Token 链接        ${DIM}带 token 的访问地址${RST}\n"
+    printf " 6. 状态与日志             ${DIM}运行结论 + 最近日志${RST}\n"
+    echo "------------------------------"
+    printf " 7. 插件管理               ${DIM}安装/启停 + 插件列表备份${RST}\n"
+    printf " 8. 备份与恢复             ${DIM}会话 / 完整数据 / 恢复前快照${RST}\n"
+    echo "------------------------------"
+    printf " 9. 维护工具               ${DIM}服务名 / Node / 换源 / 工作区${RST}\n"
+    printf "10. 卸载                   ${DIM}服务 / 程序本体 / 本脚本${RST}\n"
+    echo "------------------------------"
+
+    # ---------- 状态区：带 [标签] 的短行（值是变长的，不做列对齐）----------
+    local DSH_TXT DSH_COLOR DSH_TAG
     if check_dsh_installed; then
         DSH_TXT=$(get_dsh_version)
+        DSH_COLOR="$GRN"; DSH_TAG="[已安装]"
     else
-        DSH_TXT="未安装"; DSH_COLOR="$RED"
+        DSH_TXT="未安装"; DSH_COLOR="$RED"; DSH_TAG="[未安装]"
     fi
 
     local UNIT="/etc/systemd/system/${SVC}.service"
-    local STATE_TXT="" STATE_COLOR="$GRN" PID_TXT=""
+    local STATE_TXT STATE_COLOR STATE_TAG="" PID_TXT=""
     if [ ! -f "$UNIT" ]; then
-        STATE_TXT="未初始化"; STATE_COLOR="$YEL"
+        STATE_TXT="未初始化"; STATE_COLOR="$YEL"; STATE_TAG="[未初始化]"
     else
         local ACTIVE
         ACTIVE=$(svc_prop ActiveState | tr -d ' ')
         if [ "$ACTIVE" = "active" ]; then
-            STATE_TXT="运行中"
+            STATE_TXT="运行中"; STATE_COLOR="$GRN"; STATE_TAG="[运行中]"
             PID_TXT=$(svc_prop MainPID | tr -d ' ')
         elif [ "$ACTIVE" = "failed" ]; then
-            STATE_TXT="启动失败"; STATE_COLOR="$RED"
+            STATE_TXT="启动失败"; STATE_COLOR="$RED"; STATE_TAG="[启动失败]"
         else
-            STATE_TXT="未运行"; STATE_COLOR="$RED"
+            STATE_TXT="未运行"; STATE_COLOR="$RED"; STATE_TAG="[未运行]"
         fi
     fi
 
-    printf "DSH   ${DSH_COLOR}%s${RST}\n" "$DSH_TXT"
-    printf "服务  %s  ${STATE_COLOR}%s${RST}\n" "$SVC" "$STATE_TXT"
+    printf " DSH    ${DSH_COLOR}%s  %s${RST}\n" "$DSH_TXT" "$DSH_TAG"
     if [ -n "$PID_TXT" ] && [ "$PID_TXT" != "0" ]; then
-        printf "端口  %s   PID %s\n" "$DSH_PORT" "$PID_TXT"
+        printf " 服务   ${STATE_COLOR}%s  %s PID %s${RST}\n" "$SVC" "$STATE_TAG" "$PID_TXT"
     else
-        printf "端口  %s\n" "$DSH_PORT"
+        printf " 服务   ${STATE_COLOR}%s  %s${RST}\n" "$SVC" "$STATE_TAG"
     fi
+    printf " 端口   %s\n" "$DSH_PORT"
     if ! check_dsh_installed; then
-        printf "${YEL}DSH 未安装，输入 1 一键开始${RST}\n"
+        printf "${YEL}DSH 未安装：按 1 一键开始${RST}\n"
     fi
-    echo
+    echo "------------------------------"
 
-    # ---- 选项区：一项一行，不带注释 ----
-    echo " 1. 快速开始"
-    echo " 2. 启动"
-    echo " 3. 停止"
-    echo " 4. 重启"
-    echo " 5. 获取 Token 链接"
-    echo " 6. 状态与日志"
-    echo " 7. 插件管理"
-    echo " 8. 备份与恢复"
-    echo " 9. 维护工具"
-    echo "10. 卸载"
-    echo
-    echo "00. 更新管理脚本"
-    echo " 0. 退出"
-    echo
-    printf "请输入选项："
+    # ---------- 更新与退出 ----------
+    printf "00. 更新管理脚本           ${DIM}当前 v%s${RST}\n" "$SCRIPT_VERSION"
+    echo "------------------------------"
+    echo " 0. 退出脚本"
+    echo "------------------------------"
+    printf "请输入你的选择: "
 }
 
 # ========== 主循环 ==========
