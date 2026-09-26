@@ -73,7 +73,7 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.9.0 ====
+==== DSH-Web 管理面板 v1.10.0 ====
 
 DSH   0.1.5-rc.2
 服务  dsh-web  运行中
@@ -104,11 +104,26 @@ DSH   0.1.5-rc.2
 
 | 类型 | 内容 | 本机实测 |
 |---|---|---|
-| 1. 仅对话记录 | `sessions/` | 约 15 MB |
+| 1. 对话记录 | `sessions/` + `storages/workspace.json` + `storages/session_projcache/` | 约 16 MB |
 | 2. 完整备份（不含插件） | `storages/`、`settings.yaml`、登录凭据、`attachments/`、`im/ integrations/ llm-*` | 约 60 MB |
 
-两档都排除 `cache/`、`telemetry/`；完整备份另外排除 `profiles/` 与 `backups/` 自身。
-恢复只覆盖、不删除目标端已有数据。
+**为什么"对话记录"不只备 `sessions/`**：会话正文里既没有标题，也没有工作区归属和归档状态：
+
+| 你看到的东西 | 实际存在哪 |
+|---|---|
+| 对话内容 | `sessions/<工作区路径编码>/<会话 id>/session.v3.jsonl.zstd` |
+| 属于哪个工作区 | `storages/workspace.json` → `tables.workspaces.<id>.sessionIds` |
+| 是否已归档 | `storages/workspace.json` → `global.archivedSessionIds` |
+| 对话标题 | `storages/session_projcache/sessions/<id>.json` → `rows.title` |
+
+只备 `sessions/` 的话，恢复到别的机器后会出现三个症状：所有对话掉进「未分类」、
+标题变成工作区名、已归档的对话重新冒出来。后两个文件加起来才 1.1 MB，所以第 1 档一并带上。
+
+**跨机器恢复要注意**：工作区按**绝对路径**记录（如 `/root/DSH/文档`）。
+换服务器后该路径通常不存在，工作区记录仍在，但要能打开还得在新机器上建出同样的路径。
+
+恢复只覆盖同名文件、**不删除**目标端已有数据（有无 `rsync` 都是如此）。
+若目标机已有工作区，覆盖前会把 `storages/workspace.json` 另存为 `.bak-<时间>`。
 
 **为什么不备份插件代码**：插件是 registry 上随时可重新下载的派生品，不是不可替代的数据；
 而且每个插件都用 `dsh.compatibility` / `peerDependencies` 声明了它支持的 DSH 版本范围，

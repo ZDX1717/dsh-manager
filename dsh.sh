@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.9.0"
+SCRIPT_VERSION="1.10.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1888,17 +1888,24 @@ backup_sessions() {
             backup_file=$(generate_backup_filename "dsh_dialogue_backup")
 
             echo
-            echo "正在执行最小备份（仅对话记录）..."
+            echo "正在执行备份（对话记录）..."
             echo "备份内容："
-            echo "- 会话数据 (sessions/) - 全部对话记录"
+            echo "- 会话正文 (sessions/)"
+            echo "- 工作区归属与归档状态 (storages/workspace.json)"
+            echo "- 会话标题等 (storages/session_projcache/)"
+            echo
+            echo "后两项缺一不可：只备 sessions/ 的话，恢复后所有对话会掉进"
+            echo "「未分类」、标题变成工作区名、已归档的也会重新冒出来。"
             echo
             echo "注意：本备份不含插件、设置和附件。"
-            echo "恢复到本机没问题（恢复只覆盖、不删除）；"
-            echo "换机器或重装后恢复，请改用第 2 种完整备份。"
+            echo "换机器或重装后恢复，建议改用第 2 种完整备份。"
             echo
 
             start_backup_animation "正在创建备份"
-            pack_dsh_backup "$backup_file" sessions
+            pack_dsh_backup "$backup_file" \
+                sessions \
+                storages/workspace.json \
+                storages/session_projcache
             cleanup_animation
             ;;
         2)
@@ -2090,7 +2097,16 @@ restore_sessions() {
     
     # 停止动画
     cleanup_animation
-    
+
+    # 目标端已有的工作区注册表会被备份里的同名文件覆盖，
+    # 先留一份，别让"恢复旧备份"顺手抹掉现在的工作区分组。
+    local ws="$dsh_dir/storages/workspace.json"
+    if [ -f "$ws" ] && [ -f "$temp_restore_dir/.dsh/storages/workspace.json" ]; then
+        if cp "$ws" "$ws.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null; then
+            echo "已把当前工作区注册表另存为 workspace.json.bak-*"
+        fi
+    fi
+
     # 执行实际恢复
     echo -n "正在恢复数据到目标目录"
     (
@@ -2110,40 +2126,12 @@ restore_sessions() {
             restore_result=1
         fi
     else
-        # 没有 rsync：改为"先移开、再落盘、成功才删"，
-        # 绝不在未确认可回退的情况下 rm -rf 用户数据。
-        local stash="${dsh_dir}.old.$$"
-        local moved=0
-        if [ -d "$dsh_dir" ]; then
-            if ! mv "$dsh_dir" "$stash" 2>/dev/null; then
-                cleanup_animation
-                rm -rf "$temp_restore_dir"
-                printf " 失败\n"
-                err "无法暂存当前数据目录，已中止恢复（未做任何删除）"
-                echo "  目标：$dsh_dir"
-                return 1
-            fi
-            moved=1
-        fi
-        
+        # 没有 rsync：就地解包覆盖。
+        # tar 解包本身就是"同名覆盖、其余原样保留"，等价于 rsync 不带 --delete；
+        # 旧实现把整个 ~/.dsh 移开再解包、成功后删掉旧的，
+        # 那等于"备份里没有的东西全部删除" —— 最小备份会把插件直接抹掉。
         if ! tar -cf - -C "$temp_restore_dir" .dsh 2>/dev/null | tar -xf - -C "$HOME" 2>/dev/null; then
             restore_result=1
-        fi
-        
-        # 解压出来的目录必须存在且非空，否则视为失败并回滚
-        if [ $restore_result -eq 0 ] && [ ! -d "$dsh_dir" ]; then
-            restore_result=1
-        fi
-        
-        if [ $restore_result -ne 0 ]; then
-            rm -rf "$dsh_dir" 2>/dev/null
-            if [ $moved -eq 1 ]; then
-                mv "$stash" "$dsh_dir" 2>/dev/null
-                echo
-                warn "恢复失败，已回滚到原数据"
-            fi
-        elif [ $moved -eq 1 ]; then
-            rm -rf "$stash" 2>/dev/null
         fi
     fi
     
