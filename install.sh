@@ -59,7 +59,7 @@ CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 # dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
 # 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
 # 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
-PAYLOAD_SHA256="12d70bdc9a64e69181fb136b819950322c76fa8bfec8a0543353d866fb27a94b"
+PAYLOAD_SHA256="e87408dc7f7e91873360ca7cf899655ddd66e916ec7893b8a56063f386e2f889"
 # 写进 profile 片段的标记行：用于判断"这文件是不是本脚本写的"，
 # 避免把 /etc/passwd 这类无关文件截断成两行 alias
 PROFILE_MARK="# DSH 管理脚本快捷命令"

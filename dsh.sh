@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.17.0"
+SCRIPT_VERSION="1.17.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -2734,7 +2734,11 @@ restore_sessions() {
     # 列出可用的备份文件
     echo "可恢复的备份："
     echo
-    local backup_files=($(list_backups_data_grouped))
+    # 逐行读入数组：$(...) 词分割遇到空格/通配符会把文件名拆错
+    local -a backup_files=()
+    while IFS= read -r _bf; do
+        [ -n "$_bf" ] && backup_files+=("$_bf")
+    done < <(list_backups_data_grouped)
 
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份数据"
@@ -2962,7 +2966,11 @@ backup_management() {
     fi
     
     # 列出所有备份文件
-    local backup_files=($(list_backups_data_grouped))
+    # 逐行读入数组：$(...) 词分割遇到空格/通配符会把文件名拆错
+    local -a backup_files=()
+    while IFS= read -r _bf; do
+        [ -n "$_bf" ] && backup_files+=("$_bf")
+    done < <(list_backups_data_grouped)
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -3103,7 +3111,7 @@ clean_backups_select() {
     local selected_indices=()
     for num in $input; do
         if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total_count" ]; then
-            selected_indices+=($((num-1)))
+            selected_indices+=("$((num - 1))")
         else
             warn "忽略无效序号：$num"
         fi
@@ -3197,7 +3205,11 @@ test_backup_restore() {
     fi
     
     # 列出可用的备份文件
-    local backup_files=($(list_backups_data_grouped))
+    # 逐行读入数组：$(...) 词分割遇到空格/通配符会把文件名拆错
+    local -a backup_files=()
+    while IFS= read -r _bf; do
+        [ -n "$_bf" ] && backup_files+=("$_bf")
+    done < <(list_backups_data_grouped)
 
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
