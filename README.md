@@ -33,6 +33,10 @@ bash <(curl -sSL https://cdn.jsdelivr.net/gh/ZDX1717/dsh-manager@main/install.sh
 | `--skip-verify` | 跳过 `dsh.sh` 的 SHA-256 校验 |
 | `-h`, `--help` | 显示帮助 |
 
+下载的 `dsh.sh` 会做 SHA-256 校验，不通过就自动换下一个源（每个源限时：连接 8s / 总计 30s）。
+
+不要写成 `sudo bash <(curl ...)`：`<( )` 传的是 `/dev/fd/N`，sudo 会关闭 3 号以上的 fd，root 的 bash 打不开该路径，报 `bash: /dev/fd/63: No such file or directory`。去掉 `sudo` 即可。
+
 环境变量：`DSH_RAW_BASE`、`DSH_EXTRA_MIRRORS`、`DSH_INSTALL_DIR`、`DSH_LINK_DIR`、`DSH_GITHUB_API`。
 
 安装后重新登录（或 `source ~/.bashrc`）即可用 `d` 打开管理面板。
