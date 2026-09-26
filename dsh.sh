@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.18.1"
+SCRIPT_VERSION="1.18.2"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -4560,9 +4560,9 @@ menu() {
     fi
     printf "端口  %s\n" "$DSH_PORT"
     echo "命令行输入 d 可快速启动脚本"
-    echo
+    echo "------------------------------"
 
-    # ---------- 选项区：不带任何说明文字 ----------
+    # ---------- 选项区：不带说明文字 ----------
     echo " 1. 快速开始"
     echo " 2. 启动服务"
     echo " 3. 停止服务"
@@ -4573,10 +4573,11 @@ menu() {
     echo " 8. 备份与恢复"
     echo " 9. 维护工具"
     echo "10. 卸载"
-    echo
+    echo "------------------------------"
     echo "00. 更新管理脚本"
+    echo "------------------------------"
     echo " 0. 退出脚本"
-    echo
+    echo "------------------------------"
     printf "请输入选项："
 }
 
