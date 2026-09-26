@@ -20,13 +20,13 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.18.4"
+SCRIPT_VERSION="1.19.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
 # 仓库 raw 基地址（拼 install.sh 等其它文件时用）
 RAW_BASE="${DSH_RAW_BASE:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main}"
-SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-$RAW_BASE/dsh.sh}"
+SCRIPT_RAW_URL="$RAW_BASE/dsh.sh"
 # GitHub API 基地址（解析 commit SHA 用）。
 # 网络屏蔽 api.github.com 时可指向自建镜像：
 #   DSH_GITHUB_API=https://your.mirror/proxy/api.github.com
@@ -200,14 +200,6 @@ install_guide() {
     echo "  也可以手动执行：npm install -g @deepseek-ai/dsh"
 }
 
-# ========== 预检查 ==========
-pre_check() {
-    if ! check_dsh_installed; then
-        install_guide
-        return 1
-    fi
-    return 0
-}
 
 # ========== 以 root 权限执行命令 ==========
 # 不看"是不是 root"，而是"当前能不能直接干"：非 root 一律走 sudo。
@@ -760,7 +752,7 @@ download_self_update() {
     local tried=0 mismatch=0
     while IFS= read -r url; do
         [ -n "$url" ] || continue
-        # 源串来自 DSH_SCRIPT_URL / DSH_EXTRA_MIRRORS，只接受 http(s)：
+        # 源串来自 DSH_RAW_BASE / DSH_EXTRA_MIRRORS，只接受 http(s)：
         # 否则以 "-" 开头的值会被 curl 当成选项
         case "$url" in
             http://*|https://*) ;;
@@ -1447,7 +1439,6 @@ strip_alias_lines() {
     # alias d='bash ~/deploy.sh' 一起删掉。
     sed_inplace "$rc" \
         -e '/^# DSH 管理脚本快捷命令$/d' \
-        -e '/^# DSH-Web 管理脚本快捷命令$/d' \
         -e "/^alias d='$TARGET_NAME'$/d" \
         -e "/^alias d='bash .*\/\(dsh-manager\|dsh\.sh\)'$/d" 2>/dev/null
     return 0
@@ -1721,15 +1712,13 @@ generate_backup_filename() {
 }
 
 # ---------- 备份类型：前缀即类型，列表/清理都靠它区分 ----------
-# dialogue = 仅对话记录；data = 对话+插件+配置；full = 完整
-# sessions 是 1.5.3 以前的旧前缀（当时内容其实等于 data），保留兼容
-BACKUP_PREFIXES="dsh_dialogue_backup|dsh_data_backup|dsh_sessions_backup|dsh_full_backup|dsh_plugins_backup|dsh_prerestore"
+# dialogue = 仅对话记录；full = 完整数据；plugins = 插件清单；prerestore = 恢复前快照
+BACKUP_PREFIXES="dsh_dialogue_backup|dsh_full_backup|dsh_plugins_backup|dsh_prerestore"
 
 # 由文件名判断备份类型，给用户看的短标签
 backup_kind() {
     case "$(basename "$1")" in
         dsh_dialogue_backup*) echo "仅对话" ;;
-        dsh_data_backup*|dsh_sessions_backup*) echo "对话+插件" ;;
         dsh_full_backup*)     echo "完整" ;;
         dsh_plugins_backup*)  echo "插件清单" ;;
         dsh_prerestore*)      echo "恢复前快照" ;;
@@ -1809,12 +1798,11 @@ recreate_workspace_dirs() {
 }
 
 # ---------- 备份分组 ----------
-# 类型顺序：完整(最有价值) -> 仅对话 -> 旧版对话+插件 -> 插件清单
+# 类型顺序：完整(最有价值) -> 仅对话 -> 插件清单
 backup_group_name() {
     case "$(basename "$1")" in
         dsh_full_backup*)                      echo "完整备份" ;;
         dsh_dialogue_backup*)                  echo "仅对话记录" ;;
-        dsh_data_backup*|dsh_sessions_backup*) echo "对话+插件（旧版）" ;;
         dsh_plugins_backup*)                   echo "插件清单" ;;
         *)                                     echo "其他" ;;
     esac
@@ -1824,9 +1812,8 @@ backup_group_order() {
     case "$(basename "$1")" in
         dsh_full_backup*)                      echo 1 ;;
         dsh_dialogue_backup*)                  echo 2 ;;
-        dsh_data_backup*|dsh_sessions_backup*) echo 3 ;;
-        dsh_plugins_backup*)                   echo 4 ;;
-        dsh_prerestore*)                       echo 5 ;;
+        dsh_plugins_backup*)                   echo 3 ;;
+        dsh_prerestore*)                       echo 4 ;;
         *)                                     echo 9 ;;
     esac
 }
@@ -1850,18 +1837,6 @@ list_backups_plugins()      { list_backups | grep '\.list$'; }
 
 # 主次分明：类型做分组标题（一级），[序号] 日期 大小 为主信息（二级），
 # 文件名缩进并用弱化色（三级）——它是给需要手动搬运的人看的，不该抢戏。
-# 插件清单专用行：多显示"里面有几个插件"，选清单时才有依据
-print_manifest_row() {
-    local idx="$1" file="$2"
-    local filename filesize filedate n
-    filename=$(basename "$file")
-    filesize=$(du -h "$file" 2>/dev/null | cut -f1)
-    filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
-    n=$(grep -c '^plugin=' "$file" 2>/dev/null)
-    printf "${BLD}[%s]${RST} %s  %8s  %s 个插件\n" "$idx" "${filedate:-未知时间}" "${filesize:-?}" "${n:-0}"
-    printf "    ${DIM}%s${RST}\n" "$filename"
-}
-
 print_backup_row() {
     local idx="$1" file="$2"
     local filename filesize filedate
@@ -2036,13 +2011,6 @@ backup_status_lines() {
     local when
     when=$(stat -c %y "$newest" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
     printf '%s  %s\n' "${when:-未知时间}" "$(backup_kind "$newest")"
-}
-
-is_plugin_manifest() {
-    case "$1" in
-        dsh_plugins_backup*|*.list) return 0 ;;
-        *) return 1 ;;
-    esac
 }
 
 # dsh 可执行文件：优先脚本配置的路径，其次 PATH
@@ -3172,8 +3140,6 @@ clean_backups_all() {
     # 删没删、删了几个都无从确认，出事后无法追溯
     local f n=0
     for f in "$BACKUP_DIR"/dsh_dialogue_backup_*.tar.gz \
-             "$BACKUP_DIR"/dsh_data_backup_*.tar.gz \
-             "$BACKUP_DIR"/dsh_sessions_backup_*.tar.gz \
              "$BACKUP_DIR"/dsh_full_backup_*.tar.gz \
              "$BACKUP_DIR"/dsh_prerestore_*.tar.gz; do
         [ -f "$f" ] || continue
@@ -3582,13 +3548,6 @@ plugin_menu_loop() {
                         local plugin_short_name=$(plugin_name_of "$plugin_name")
                         echo "启用插件：$plugin_short_name"
                         
-                        if [ ! -d "node_modules/$plugin_short_name" ] && \
-                           [ -d "node_modules/${plugin_short_name}.disabled" ]; then
-                            # 兼容早期用"重命名目录"禁用的插件
-                            mv "node_modules/${plugin_short_name}.disabled" \
-                               "node_modules/$plugin_short_name" 2>/dev/null
-                        fi
-
                         if [ ! -d "node_modules/$plugin_short_name" ]; then
                             err "插件没装（node_modules 里没有它），请先用 1 安装"
                         elif profile_bundles_has "$profile" "$plugin_short_name"; then
@@ -3952,7 +3911,6 @@ remove_alias_from_bashrc() {
     # 顺手清掉可能残留的尾部空行，一次改完再落盘。
     if ! sed_inplace "$BASHRC" \
         -e '/^# DSH 管理脚本快捷命令$/d' \
-        -e '/^# DSH-Web 管理脚本快捷命令$/d' \
         -e "/^alias d='$TARGET_NAME'$/d" \
         -e "/^alias d='bash .*\/\(dsh-manager\|dsh\.sh\)'$/d" \
         -e :a -e '/^\n*$/{$d;N;ba' -e '}' 2>/dev/null; then
