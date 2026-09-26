@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.7.2"
+SCRIPT_VERSION="1.8.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1509,8 +1509,26 @@ list_backups_grouped() {
     done | sort -s -t'|' -k1,1n | cut -d'|' -f2-
 }
 
+# 菜单 8（数据备份）与菜单 7（插件清单）各看各的：
+# 插件清单是 1KB 级元数据，混在大归档里会被"保留最近N个"顺手删掉。
+list_backups_data()         { list_backups | grep -v '\.list$'; }
+list_backups_data_grouped() { list_backups_grouped | grep -v '\.list$'; }
+list_backups_plugins()      { list_backups | grep '\.list$'; }
+
 # 主次分明：类型做分组标题（一级），[序号] 日期 大小 为主信息（二级），
 # 文件名缩进并用弱化色（三级）——它是给需要手动搬运的人看的，不该抢戏。
+# 插件清单专用行：多显示"里面有几个插件"，选清单时才有依据
+print_manifest_row() {
+    local idx="$1" file="$2"
+    local filename filesize filedate n
+    filename=$(basename "$file")
+    filesize=$(du -h "$file" 2>/dev/null | cut -f1)
+    filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
+    n=$(grep -c '^plugin=' "$file" 2>/dev/null)
+    printf "${BLD}[%s]${RST} %s  %8s  %s 个插件\n" "$idx" "${filedate:-未知时间}" "${filesize:-?}" "${n:-0}"
+    printf "    ${DIM}%s${RST}\n" "$filename"
+}
+
 print_backup_row() {
     local idx="$1" file="$2"
     local filename filesize filedate
@@ -1617,7 +1635,7 @@ list_backups() {
 # 备份现状摘要，供菜单和备份类型屏复用
 # 输出三行：数量体积 / 最近一次（时间 类型）
 backup_status_lines() {
-    local files=($(list_backups))
+    local files=($(list_backups_data))
     if [ ${#files[@]} -eq 0 ]; then
         printf '还没有备份\n—\n'
         return 0
@@ -1705,7 +1723,7 @@ backup_plugin_manifest() {
 
     {
         echo "# DSH 插件清单 —— 由 dsh-manager 生成（不含插件代码）"
-        echo "# 恢复：主菜单 8 → 2，选中本文件，会按清单逐个重装"
+        echo "# 恢复：主菜单 7 → 5 → 2，选中本文件，会按清单逐个重装"
         echo "# 手动：dsh plugin --profile $profile add <名称>@<版本>"
         echo "manifest=dsh-manager-plugin-manifest v1"
         echo "profile=$profile"
@@ -1857,8 +1875,9 @@ backup_sessions() {
     echo "选择备份类型："
     echo "1. 仅对话记录"
     echo "2. 完整备份（不含插件）"
-    echo "3. 插件清单"
     echo "0. 取消"
+    echo
+    echo "插件清单由 主菜单 7 → 5 负责，不在这里。"
     read -r -p "请选择： " BACKUP_TYPE
 
     local backup_file=""
@@ -1916,27 +1935,6 @@ backup_sessions() {
                 .dsh 2>/dev/null
             cleanup_animation
             ;;
-        3)
-            # ---------- 插件清单 ----------
-            backup_file="${BACKUP_DIR}/dsh_plugins_backup_$(date +%Y%m%d_%H%M%S).list"
-
-            echo
-            echo "正在导出插件清单（只记名称与版本，不含插件代码）..."
-            echo "内容包括："
-            echo "- 每个插件的名称与精确版本"
-            echo "- 各插件声明的 DSH 兼容范围"
-            echo "- profile 装载顺序（bundles）"
-            echo "- 你的 cordis.patch.yml 补丁层"
-            echo
-            echo "为什么不含插件代码：插件代码在 registry 上可重新下载，"
-            echo "而跨 DSH 版本搬回旧插件，正是插件跑不起来的主因。"
-            echo
-
-            if ! backup_plugin_manifest "$backup_file"; then
-                rm -f "$backup_file"
-                return 1
-            fi
-            ;;
         0)
             warn "操作已取消"
             return 0
@@ -1952,17 +1950,7 @@ backup_sessions() {
         return 1
     fi
 
-    if is_plugin_manifest "$backup_file"; then
-        info "插件清单已导出"
-        echo "文件：$(basename "$backup_file")"
-        echo "大小：$(du -h "$backup_file" | cut -f1)"
-        echo "插件：$(grep -c '^plugin=' "$backup_file" 2>/dev/null) 个"
-        echo
-        echo "恢复方式：主菜单 8 → 2，选中这个清单文件"
-        return 0
-    fi
-
-    # 数据归档才需要验证完整性
+    # 验证数据归档完整性
     if ! verify_backup "$backup_file"; then
         err "备份文件验证失败"
         return 1
@@ -1988,14 +1976,15 @@ restore_sessions() {
     # 列出可用的备份文件
     echo "可恢复的备份："
     echo
-    local backup_files=($(list_backups_grouped))
+    local backup_files=($(list_backups_data_grouped))
 
     if [ ${#backup_files[@]} -eq 0 ]; then
-        warn "没有找到备份文件"
+        warn "没有找到备份数据"
         return 1
     fi
 
     print_backup_groups "${backup_files[@]}"
+    plugin_manifest_hint
     
     echo
     echo "请输入要恢复的备份编号（或 0 取消）："
@@ -2014,12 +2003,6 @@ restore_sessions() {
     
     local selected_file="${backup_files[$((choice-1))]}"
     local filename=$(basename "$selected_file")
-
-    # 插件清单不是归档，走"按清单重装"的另一条路
-    if is_plugin_manifest "$selected_file"; then
-        restore_plugin_manifest "$selected_file"
-        return $?
-    fi
 
     # 验证备份文件完整性
     if ! verify_backup "$selected_file"; then
@@ -2198,7 +2181,7 @@ backup_management() {
     fi
     
     # 列出所有备份文件
-    local backup_files=($(list_backups_grouped))
+    local backup_files=($(list_backups_data_grouped))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -2379,7 +2362,7 @@ clean_backups_select() {
 # 删除所有备份
 clean_backups_all() {
     echo
-    echo "=== 删除所有备份 ==="
+    echo "=== 删除所有数据备份 ==="
     read -r -p "确认删除所有备份？(y/N): " CONFIRM
     
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -2388,7 +2371,6 @@ clean_backups_all() {
     fi
     
     rm -f "$BACKUP_DIR"/dsh_dialogue_backup_*.tar.gz
-    rm -f "$BACKUP_DIR"/dsh_plugins_backup_*.list
     rm -f "$BACKUP_DIR"/dsh_data_backup_*.tar.gz
     rm -f "$BACKUP_DIR"/dsh_sessions_backup_*.tar.gz
     rm -f "$BACKUP_DIR"/dsh_full_backup_*.tar.gz
@@ -2409,7 +2391,7 @@ test_backup_restore() {
     fi
     
     # 列出可用的备份文件
-    local backup_files=($(list_backups_grouped | grep -v "\.list$"))
+    local backup_files=($(list_backups_data_grouped))
 
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
@@ -2500,6 +2482,7 @@ backup_restore_management() {
         echo "目录   $BACKUP_DIR"
         printf '已有   %s\n' "$(printf '%s\n' "$status" | sed -n '1p')"
         printf '上次   %s\n' "$(printf '%s\n' "$status" | sed -n '2p')"
+        plugin_manifest_hint
         echo
         echo "1. 新建备份"
         echo "2. 恢复备份"
@@ -2665,6 +2648,7 @@ plugin_menu_loop() {
             echo
             echo "操作："
             echo "1. 安装插件"
+            echo "5. 插件清单（导出 / 恢复）"
             echo "0. 返回"
             echo
             read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -2698,6 +2682,9 @@ plugin_menu_loop() {
                     else
                         err "安装失败"
                     fi
+                    ;;
+                5)
+                    plugin_manifest_menu
                     ;;
                 0)
                     return 0
@@ -2733,6 +2720,7 @@ plugin_menu_loop() {
             echo "2. 启用插件"
             echo "3. 禁用插件"
             echo "4. 删除插件（支持批量）"
+            echo "5. 插件清单（导出 / 恢复）"
             echo "0. 返回"
             echo
             read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -2902,6 +2890,9 @@ plugin_menu_loop() {
                     else
                         warn "操作已取消"
                     fi
+                    ;;
+                5)
+                    plugin_manifest_menu
                     ;;
                 0)
                     return 0
@@ -3451,6 +3442,133 @@ status_and_logs() {
             *)
                 warn "无效选项"
                 ;;
+        esac
+
+        echo
+        printf "按回车继续..."
+        read -r null || { echo; return 0; }
+    done
+}
+
+# ========== 插件清单（菜单 7 → 5） ==========
+# 从备份与恢复搬过来：插件的东西归插件菜单，
+# 而且 1KB 的元数据混进大归档列表会被"保留最近N个"顺手删掉。
+plugin_manifest_hint() {
+    local m=($(list_backups_plugins))
+    if [ ${#m[@]} -gt 0 ]; then
+        printf "${DIM}另有 %s 个插件清单，请到 主菜单 7 → 5 恢复${RST}\n" "${#m[@]}"
+    fi
+}
+
+plugin_manifest_export() {
+    title "导出插件清单"
+    if ! init_backup_dir; then
+        return 1
+    fi
+    local out="${BACKUP_DIR}/dsh_plugins_backup_$(date +%Y%m%d_%H%M%S).list"
+    if ! backup_plugin_manifest "$out"; then
+        rm -f "$out"
+        return 1
+    fi
+    info "已导出"
+    echo "文件：$(basename "$out")"
+    echo "大小：$(du -h "$out" | cut -f1)"
+    echo "插件：$(grep -c '^plugin=' "$out" 2>/dev/null) 个"
+    echo "位置：$BACKUP_DIR"
+}
+
+plugin_manifest_restore_pick() {
+    local files=($(list_backups_plugins))
+    if [ ${#files[@]} -eq 0 ]; then
+        warn "还没有导出过插件清单"
+        echo "先用本菜单的「1. 导出当前插件清单」生成一份。"
+        return 1
+    fi
+
+    echo "可恢复的清单："
+    echo
+    local i
+    for i in "${!files[@]}"; do
+        print_manifest_row "$((i+1))" "${files[$i]}"
+    done
+    echo
+    read -r -p "请输入编号（或 0 取消）： " choice || { echo; return 0; }
+
+    if [ "$choice" = "0" ] || [ -z "$choice" ]; then
+        warn "操作已取消"
+        return 0
+    fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#files[@]} ]; then
+        err "无效的选择"
+        return 1
+    fi
+
+    restore_plugin_manifest "${files[$((choice-1))]}"
+}
+
+plugin_manifest_delete() {
+    local files=($(list_backups_plugins))
+    if [ ${#files[@]} -eq 0 ]; then
+        warn "还没有导出过插件清单"
+        return 1
+    fi
+
+    echo "现有清单："
+    echo
+    local i
+    for i in "${!files[@]}"; do
+        print_manifest_row "$((i+1))" "${files[$i]}"
+    done
+    echo
+    read -r -p "要删除的编号（多个用空格分隔，q 取消）： " input || { echo; return 0; }
+    if [ "$input" = "q" ] || [ -z "$input" ]; then
+        warn "操作已取消"
+        return 0
+    fi
+
+    local n cnt=0
+    for n in $input; do
+        if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#files[@]} ]; then
+            rm -f "${files[$((n-1))]}" && cnt=$((cnt + 1))
+        else
+            warn "忽略无效序号：$n"
+        fi
+    done
+    info "已删除 $cnt 个清单"
+}
+
+plugin_manifest_menu() {
+    while true; do
+        clear 2>/dev/null
+        title "插件清单"
+
+        local files=($(list_backups_plugins))
+        if [ ${#files[@]} -eq 0 ]; then
+            echo "还没有导出过插件清单。"
+            echo "导出的是「装了什么、什么版本」，约 1KB，不含插件代码——"
+            echo "换机器或重装后照着它把插件装回来即可。"
+        else
+            echo "已有 ${#files[@]} 个清单："
+            echo
+            local i
+            for i in "${!files[@]}"; do
+                print_manifest_row "$((i+1))" "${files[$i]}"
+            done
+        fi
+        echo
+        echo "1. 导出当前插件清单"
+        echo "2. 从清单恢复插件"
+        echo "3. 删除清单"
+        echo "0. 返回"
+        echo
+        read -r -p "请选择： " choice || { echo; return 0; }
+
+        case $choice in
+            1) plugin_manifest_export ;;
+            2) plugin_manifest_restore_pick ;;
+            3) plugin_manifest_delete ;;
+            0) return 0 ;;
+            *) warn "无效选项"; continue ;;
         esac
 
         echo
