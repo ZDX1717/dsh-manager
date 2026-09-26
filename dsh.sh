@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.2"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -47,12 +47,14 @@ if [ -t 1 ]; then
     GRN=$'\033[32m'
     YEL=$'\033[33m'
     BLD=$'\033[1m'
+    DIM=$'\033[2m'
 else
     RST=""
     RED=""
     GRN=""
     YEL=""
     BLD=""
+    DIM=""
 fi
 
 # ========== 输出函数 ==========
@@ -1476,16 +1478,84 @@ backup_kind() {
     esac
 }
 
-# 列出备份时统一用两行一条，避免超宽表格在窄终端折行
-print_backup_entry() {
+# ---------- 备份分组 ----------
+# 类型顺序：完整(最有价值) -> 仅对话 -> 旧版对话+插件 -> 插件清单
+backup_group_name() {
+    case "$(basename "$1")" in
+        dsh_full_backup*)                      echo "完整备份" ;;
+        dsh_dialogue_backup*)                  echo "仅对话记录" ;;
+        dsh_data_backup*|dsh_sessions_backup*) echo "对话+插件（旧版）" ;;
+        dsh_plugins_backup*)                   echo "插件清单" ;;
+        *)                                     echo "其他" ;;
+    esac
+}
+
+backup_group_order() {
+    case "$(basename "$1")" in
+        dsh_full_backup*)                      echo 1 ;;
+        dsh_dialogue_backup*)                  echo 2 ;;
+        dsh_data_backup*|dsh_sessions_backup*) echo 3 ;;
+        dsh_plugins_backup*)                   echo 4 ;;
+        *)                                     echo 9 ;;
+    esac
+}
+
+# 先按类型分组、组内仍是时间倒序。
+# 用稳定排序保住 list_backups 的时间序，避免"组内又乱掉"。
+list_backups_grouped() {
+    local f
+    for f in $(list_backups); do
+        printf '%s|%s\n' "$(backup_group_order "$f")" "$f"
+    done | sort -s -t'|' -k1,1n | cut -d'|' -f2-
+}
+
+# 主次分明：类型做分组标题（一级），[序号] 日期 大小 为主信息（二级），
+# 文件名缩进并用弱化色（三级）——它是给需要手动搬运的人看的，不该抢戏。
+print_backup_row() {
     local idx="$1" file="$2"
     local filename filesize filedate
     filename=$(basename "$file")
     filesize=$(du -h "$file" 2>/dev/null | cut -f1)
-    # 精确到分钟，够用且短
     filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
-    printf "[%s] %s  %s  %s\n" "$idx" "${filedate:-未知时间}" "$(backup_kind "$file")" "${filesize:-?}"
-    printf "    %s\n" "$filename"
+    printf "${BLD}[%s]${RST} %s  %8s\n" "$idx" "${filedate:-未知时间}" "${filesize:-?}"
+    printf "    ${DIM}%s${RST}\n" "$filename"
+}
+
+# 按类型分组打印（传入数组；序号与数组下标一一对应，删除时不会错位）
+print_backup_groups() {
+    local files=("$@")
+    [ ${#files[@]} -eq 0 ] && return 0
+
+    local -a names=() counts=()
+    local f g k found
+    for f in "${files[@]}"; do
+        g=$(backup_group_name "$f")
+        found=-1
+        for k in "${!names[@]}"; do
+            [ "${names[$k]}" = "$g" ] && { found=$k; break; }
+        done
+        if [ "$found" -ge 0 ]; then
+            counts[$found]=$(( ${counts[$found]} + 1 ))
+        else
+            names+=("$g"); counts+=("1")
+        fi
+    done
+
+    local cur="" n
+    for k in "${!files[@]}"; do
+        g=$(backup_group_name "${files[$k]}")
+        if [ "$g" != "$cur" ]; then
+            [ -n "$cur" ] && echo
+            n=0
+            local j
+            for j in "${!names[@]}"; do
+                [ "${names[$j]}" = "$g" ] && n=${counts[$j]}
+            done
+            printf "${BLD}── %s（%s 个）──${RST}\n" "$g" "$n"
+            cur="$g"
+        fi
+        print_backup_row "$((k+1))" "${files[$k]}"
+    done
 }
 
 # 把 ~/.dsh 下指定的顶层条目打包成 tar.gz
@@ -1918,16 +1988,14 @@ restore_sessions() {
     # 列出可用的备份文件
     echo "可恢复的备份："
     echo
-    local backup_files=($(list_backups))
-    
+    local backup_files=($(list_backups_grouped))
+
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
         return 1
     fi
-    
-    for i in "${!backup_files[@]}"; do
-        print_backup_entry "$((i+1))" "${backup_files[$i]}"
-    done
+
+    print_backup_groups "${backup_files[@]}"
     
     echo
     echo "请输入要恢复的备份编号（或 0 取消）："
@@ -2121,7 +2189,7 @@ restore_sessions() {
 # 查看备份列表
 # 备份管理主菜单
 backup_management() {
-    title "管理备份列表"
+    title "管理备份文件"
     
     # 检查备份目录是否存在
     if [ ! -d "$BACKUP_DIR" ]; then
@@ -2130,24 +2198,19 @@ backup_management() {
     fi
     
     # 列出所有备份文件
-    local backup_files=($(list_backups))
+    local backup_files=($(list_backups_grouped))
     
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
         return 0
     fi
     
-    # 显示备份列表
-    echo "=== 备份文件列表 ==="
-    echo "格式：[序号] 日期时间  类型  大小"
+    # 按类型分组展示，组内时间倒序；序号即数组下标，删除不会错位
+    local total_size
+    total_size=$(du -ch "${backup_files[@]}" 2>/dev/null | tail -n1 | cut -f1)
+    printf '共 %s 个，%s\n' "${#backup_files[@]}" "${total_size:-?}"
     echo
-
-    for i in "${!backup_files[@]}"; do
-        print_backup_entry "$((i+1))" "${backup_files[$i]}"
-    done
-    
-    echo
-    echo "总共 ${#backup_files[@]} 个备份文件"
+    print_backup_groups "${backup_files[@]}"
     echo
     
     # 显示管理选项
@@ -2161,7 +2224,7 @@ backup_management() {
     read -r -p "请选择： " choice
     
     case $choice in
-        1) clean_backups_batch "${backup_files[@]}" ;;
+        1) clean_backups_batch $(list_backups) ;;   # 按时间序保留"最近N个"
         2) clean_backups_select "${backup_files[@]}" ;;
         3) clean_backups_all ;;
         0) return 0 ;;
@@ -2346,18 +2409,16 @@ test_backup_restore() {
     fi
     
     # 列出可用的备份文件
-    local backup_files=($(list_backups | grep -v "\.list$"))
-    
+    local backup_files=($(list_backups_grouped | grep -v "\.list$"))
+
     if [ ${#backup_files[@]} -eq 0 ]; then
         warn "没有找到备份文件"
         return 1
     fi
-    
-    echo "可恢复的备份："
+
+    echo "可测试的数据归档："
     echo
-    for i in "${!backup_files[@]}"; do
-        print_backup_entry "$((i+1))" "${backup_files[$i]}"
-    done
+    print_backup_groups "${backup_files[@]}"
     
     echo
     echo "请输入要测试的备份编号（或 0 取消）："
