@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.14.0"
+SCRIPT_VERSION="1.14.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1903,6 +1903,16 @@ plugin_add_with_builds() {
     if [ "$builds_err" -eq 0 ]; then
         # 与构建脚本无关的失败：原样展示 dsh 的报错
         printf '%s\n' "$out" | grep -v '^$' | tail -n4 | sed 's/^/      /'
+        # 小内存机器上 fork/exec 会直接失败，报错只有一句 spawn ENOMEM，
+        # 看上去像"插件坏了"，其实是机器内存不够
+        if printf '%s\n' "$out" | grep -qi 'ENOMEM\|Cannot allocate memory'; then
+            echo
+            warn "进程创建失败（ENOMEM）—— 多半是内存不足，不是插件的问题"
+            echo "      先看内存与 swap：free -h"
+            echo "      小内存机器加 1~2GB swap 后重试即可，例如："
+            echo "        fallocate -l 2G /swapfile && chmod 600 /swapfile"
+            echo "        mkswap /swapfile && swapon /swapfile"
+        fi
         return 1
     fi
 
