@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.8.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1733,7 +1733,7 @@ backup_plugin_manifest() {
         echo "# 已安装插件（名称@精确版本）"
         printf '%s\n' "$lines" | grep '^plugin='
         echo
-        echo "# 各插件声明的 DSH 兼容范围（- 表示没声明）"
+        echo "# 各插件声明的 DSH 兼容范围（没声明的不列出）"
         printf '%s\n' "$lines" | grep '^declared=' || echo "# (无)"
         echo
         echo "# profile 装载的 bundle 顺序"
@@ -1784,7 +1784,8 @@ restore_plugin_manifest() {
     echo "目标 profile：$profile"
     echo "清单生成时的 DSH：${saved_dsh:-未知}    当前 DSH：${cur_dsh:-未知}"
     if [ -n "$saved_dsh" ] && [ -n "$cur_dsh" ] && [ "$saved_dsh" != "$cur_dsh" ]; then
-        warn "DSH 版本已经变了，按原版本重装的插件未必适配当前版本"
+        warn "DSH 版本已经变了：按原版本装回的插件未必兼容当前版本"
+        echo "      装失败、或装完 DSH 起不来都属正常，请谨慎。"
     fi
     echo
     echo "将要安装："
@@ -1984,7 +1985,6 @@ restore_sessions() {
     fi
 
     print_backup_groups "${backup_files[@]}"
-    plugin_manifest_hint
     
     echo
     echo "请输入要恢复的备份编号（或 0 取消）："
@@ -2482,7 +2482,6 @@ backup_restore_management() {
         echo "目录   $BACKUP_DIR"
         printf '已有   %s\n' "$(printf '%s\n' "$status" | sed -n '1p')"
         printf '上次   %s\n' "$(printf '%s\n' "$status" | sed -n '2p')"
-        plugin_manifest_hint
         echo
         echo "1. 新建备份"
         echo "2. 恢复备份"
@@ -2648,7 +2647,7 @@ plugin_menu_loop() {
             echo
             echo "操作："
             echo "1. 安装插件"
-            echo "5. 插件清单（导出 / 恢复）"
+            echo "5. 插件清单（查看 / 导出 / 恢复）"
             echo "0. 返回"
             echo
             read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -2720,7 +2719,7 @@ plugin_menu_loop() {
             echo "2. 启用插件"
             echo "3. 禁用插件"
             echo "4. 删除插件（支持批量）"
-            echo "5. 插件清单（导出 / 恢复）"
+            echo "5. 插件清单（查看 / 导出 / 恢复）"
             echo "0. 返回"
             echo
             read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -3453,11 +3452,99 @@ status_and_logs() {
 # ========== 插件清单（菜单 7 → 5） ==========
 # 从备份与恢复搬过来：插件的东西归插件菜单，
 # 而且 1KB 的元数据混进大归档列表会被"保留最近N个"顺手删掉。
-plugin_manifest_hint() {
-    local m=($(list_backups_plugins))
-    if [ ${#m[@]} -gt 0 ]; then
-        printf "${DIM}另有 %s 个插件清单，请到 主菜单 7 → 5 恢复${RST}\n" "${#m[@]}"
+# 选一个清单；只有一个就直接用，省一次选择
+plugin_manifest_pick() {
+    local files=($(list_backups_plugins))
+    if [ ${#files[@]} -eq 0 ]; then
+        warn "还没有导出过插件清单" >&2
+        return 1
     fi
+    if [ ${#files[@]} -eq 1 ]; then
+        printf '%s\n' "${files[0]}"
+        return 0
+    fi
+
+    echo "请选择清单：" >&2
+    echo >&2
+    local i
+    for i in "${!files[@]}"; do
+        print_manifest_row "$((i+1))" "${files[$i]}" >&2
+    done
+    echo >&2
+    local c
+    read -r -p "编号（0 取消）： " c || return 1
+    if [ "$c" = "0" ] || [ -z "$c" ]; then
+        warn "操作已取消" >&2
+        return 1
+    fi
+    if ! [[ "$c" =~ ^[0-9]+$ ]] || [ "$c" -lt 1 ] || [ "$c" -gt ${#files[@]} ]; then
+        err "无效的选择" >&2
+        return 1
+    fi
+    printf '%s\n' "${files[$((c-1))]}"
+}
+
+# 清单的主要用途：看清楚"当时装了什么、什么版本"，
+# 换机器或重装后照着装。是否真去重装由用户判断——DSH 版本不同时插件未必兼容。
+plugin_manifest_view() {
+    title "清单内容"
+
+    local file
+    file=$(plugin_manifest_pick) || return 1
+
+    local profile created saved_dsh cur_dsh
+    profile=$(grep -m1 '^profile=' "$file" 2>/dev/null | cut -d= -f2)
+    created=$(grep -m1 '^created=' "$file" 2>/dev/null | cut -d= -f2)
+    saved_dsh=$(grep -m1 '^dsh_version=' "$file" 2>/dev/null | cut -d= -f2)
+    cur_dsh=$(get_dsh_version 2>/dev/null)
+
+    echo "文件：$(basename "$file")"
+    echo "生成：${created:-未知}"
+    echo "profile：${profile:-未知}"
+    echo "当时 DSH：${saved_dsh:-未知}"
+    echo "当前 DSH：${cur_dsh:-未知}"
+    if [ -n "$saved_dsh" ] && [ -n "$cur_dsh" ] && [ "$saved_dsh" != "$cur_dsh" ]; then
+        warn "DSH 版本已经变了，下面这些插件未必兼容当前版本"
+    fi
+    echo
+
+    local n=0 entry name d
+    echo "插件（按依赖声明顺序）："
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        n=$((n + 1))
+        name="${entry%@*}"
+        printf '  %2d. %s\n' "$n" "$entry"
+        d=$(grep -m1 "^declared=${name} " "$file" 2>/dev/null | sed 's/^declared=[^ ]* //')
+        [ -n "$d" ] && printf '      声明兼容 %s\n' "$d"
+    done < <(grep '^plugin=' "$file" 2>/dev/null | sed 's/^plugin=//')
+    echo "  共 $n 个"
+    echo
+
+    local nb=0 b
+    echo "bundle 装载顺序："
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        nb=$((nb + 1))
+        printf '  %2d. %s\n' "$nb" "$b"
+    done < <(grep '^bundle=' "$file" 2>/dev/null | sed 's/^bundle=//')
+    echo "  共 $nb 个"
+    echo
+
+    local patch patch_real
+    patch=$(sed -n '/^patch_begin$/,/^patch_end$/p' "$file" 2>/dev/null | sed '1d;$d')
+    # 只剩注释、空行和 [] 的，就是 DSH 生成的默认模板，不算"有内容"
+    patch_real=$(printf '%s\n' "$patch" | grep -v '^[[:space:]]*#' \
+        | grep -v '^[[:space:]]*$' | grep -v '^\[\]$')
+    if [ -n "$patch_real" ]; then
+        echo "补丁层 cordis.patch.yml：有自定义内容"
+        printf '%s\n' "$patch" | sed 's/^/  /'
+    else
+        echo "补丁层 cordis.patch.yml：空（默认模板）"
+    fi
+    echo
+    echo "手动安装："
+    echo "  dsh plugin --profile ${profile:-web} add <名称>@<版本>"
 }
 
 plugin_manifest_export() {
@@ -3554,19 +3641,24 @@ plugin_manifest_menu() {
             for i in "${!files[@]}"; do
                 print_manifest_row "$((i+1))" "${files[$i]}"
             done
+            echo
+            echo "清单记录的是「当时装了哪些插件、什么版本」，"
+            echo "换机器或重装后照着装即可。"
         fi
         echo
-        echo "1. 导出当前插件清单"
-        echo "2. 从清单恢复插件"
-        echo "3. 删除清单"
+        echo "1. 查看清单内容"
+        echo "2. 导出当前插件清单"
+        echo "3. 从清单恢复插件（DSH 版本不同时可能不兼容）"
+        echo "4. 删除清单"
         echo "0. 返回"
         echo
         read -r -p "请选择： " choice || { echo; return 0; }
 
         case $choice in
-            1) plugin_manifest_export ;;
-            2) plugin_manifest_restore_pick ;;
-            3) plugin_manifest_delete ;;
+            1) plugin_manifest_view ;;
+            2) plugin_manifest_export ;;
+            3) plugin_manifest_restore_pick ;;
+            4) plugin_manifest_delete ;;
             0) return 0 ;;
             *) warn "无效选项"; continue ;;
         esac
