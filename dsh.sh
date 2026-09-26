@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.12.0"
+SCRIPT_VERSION="1.13.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1790,6 +1790,90 @@ ensure_pnpm() {
     return 1
 }
 
+# ---------- 依赖构建脚本放行 ----------
+# pnpm 11 起 strictDepBuilds 默认为真：没放行的依赖不许执行安装脚本，
+# 带原生模块的（sharp / node-pty 等）会直接装不上，并把它们写成
+#   allowBuilds:
+#     sharp: set this to true or false
+# 等用户放行。这种失败信息很隐晦，容易误判成"插件下架了"。
+PLUGIN_BUILDS_DECISION="${PLUGIN_BUILDS_DECISION:-}"
+
+approve_ignored_builds() {
+    local profile="$1"
+    local f="$HOME/.dsh/profiles/$profile/pnpm-workspace.yaml"
+    if [ ! -f "$f" ]; then
+        err "找不到 $f"
+        return 1
+    fi
+    if ! grep -q 'set this to true or false' "$f"; then
+        warn "文件里没有待放行的条目"
+        echo "可手动执行：cd $(dirname "$f") && pnpm approve-builds"
+        return 1
+    fi
+    cp "$f" "$f.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null
+    sed -i 's/: *set this to true or false *$/: true/' "$f"
+    if grep -q 'set this to true or false' "$f"; then
+        err "仍有未放行的条目，请手动执行 pnpm approve-builds"
+        return 1
+    fi
+    info "已放行（原文件另存为 .bak-*）"
+    return 0
+}
+
+# 装一个插件；若失败原因是构建脚本未放行，问一次是否放行并重试
+plugin_add_with_builds() {
+    local profile="$1" spec="$2"
+    local dshbin out
+    dshbin=$(dsh_cmd)
+
+    if out=$("$dshbin" plugin --profile "$profile" add "$spec" 2>&1); then
+        return 0
+    fi
+
+    local builds_err=0
+    printf '%s\n' "$out" | grep -q 'should be allowed to run scripts\|Ignored build scripts' && builds_err=1
+
+    if [ "$builds_err" -eq 0 ]; then
+        # 与构建脚本无关的失败：原样展示 dsh 的报错
+        printf '%s\n' "$out" | grep -v '^$' | tail -n4 | sed 's/^/      /'
+        return 1
+    fi
+
+    # 本轮已经问过并拒绝了，就别再刷同样的报错
+    if [ "$PLUGIN_BUILDS_DECISION" = "no" ]; then
+        return 1
+    fi
+
+    if [ "$PLUGIN_BUILDS_DECISION" != "yes" ]; then
+        local pkgs
+        pkgs=$(printf '%s\n' "$out" | sed -n 's/.*Ignored build scripts: *//p' | head -1 | sed 's/[[:space:]]*$//')
+        echo
+        warn "pnpm 拦下了构建脚本：${pkgs:-（见上面的输出）}"
+        echo "      pnpm 11 默认 strictDepBuilds：没放行的依赖不许执行安装脚本，"
+        echo "      带原生模块的（sharp / node-pty 等）就会装不上。"
+        echo
+        read -r -p "放行这些依赖的构建脚本并重试？(y/N): " CONFIRM || CONFIRM=""
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            PLUGIN_BUILDS_DECISION="yes"
+            if ! approve_ignored_builds "$profile"; then
+                PLUGIN_BUILDS_DECISION="no"
+                return 1
+            fi
+        else
+            PLUGIN_BUILDS_DECISION="no"
+            warn "已跳过放行"
+            return 1
+        fi
+    fi
+
+    echo "      重试 $spec ..."
+    if out=$("$dshbin" plugin --profile "$profile" add "$spec" 2>&1); then
+        return 0
+    fi
+    printf '%s\n' "$out" | grep -v '^$' | tail -n4 | sed 's/^/      /'
+    return 1
+}
+
 # 读 profile 的插件与 bundle 清单，输出 "plugin=名字@版本" / "declared=..." / "bundle=..."
 # 用 node 解析 JSON —— DSH 本身就依赖 node，等于零额外依赖，
 # 比自己用 sed 抠 package.json 稳得多。
@@ -1935,17 +2019,14 @@ restore_plugin_manifest() {
         return 0
     fi
 
-    local DSH_BIN_REAL
-    DSH_BIN_REAL=$(dsh_cmd)
-    local okn=0 badn=0 out
+    local okn=0 badn=0
     for i in "${!names[@]}"; do
         echo
         echo "--- [$((i+1))/${#names[@]}] ${names[$i]}@${vers[$i]}"
-        if out=$("$DSH_BIN_REAL" plugin --profile "$profile" add "${names[$i]}@${vers[$i]}" 2>&1); then
+        if plugin_add_with_builds "$profile" "${names[$i]}@${vers[$i]}"; then
             okn=$((okn + 1))
         else
             badn=$((badn + 1))
-            printf '%s\n' "$out" | grep -v '^$' | tail -n2 | sed 's/^/      /'
             warn "安装失败：${names[$i]}@${vers[$i]}"
         fi
     done
@@ -2801,8 +2882,7 @@ plugin_menu_loop() {
                         warn "没有 pnpm，装不了插件"
                         continue
                     fi
-                    dsh plugin --profile "$profile" add "$PLUGIN_NAME"
-                    if [ $? -eq 0 ]; then
+                    if plugin_add_with_builds "$profile" "$PLUGIN_NAME"; then
                         info "安装成功：$PLUGIN_NAME"
                         echo "提示：可能需要重启 DSH 服务"
                     else
@@ -2877,8 +2957,7 @@ plugin_menu_loop() {
                         warn "没有 pnpm，装不了插件"
                         continue
                     fi
-                    dsh plugin --profile "$profile" add "$PLUGIN_NAME"
-                    if [ $? -eq 0 ]; then
+                    if plugin_add_with_builds "$profile" "$PLUGIN_NAME"; then
                         info "安装成功：$PLUGIN_NAME"
                         echo "提示：可能需要重启 DSH 服务"
                     else
