@@ -20,11 +20,13 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.16.0"
+SCRIPT_VERSION="1.17.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
-SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main/dsh.sh}"
+# 仓库 raw 基地址（拼 install.sh 等其它文件时用）
+RAW_BASE="${DSH_RAW_BASE:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main}"
+SCRIPT_RAW_URL="${DSH_SCRIPT_URL:-$RAW_BASE/dsh.sh}"
 # GitHub API 基地址（解析 commit SHA 用）。
 # 网络屏蔽 api.github.com 时可指向自建镜像：
 #   DSH_GITHUB_API=https://your.mirror/proxy/api.github.com
@@ -61,6 +63,41 @@ fi
 info()  { printf "${GRN}${BLD}[完成]${RST} %s\n" "$1"; }
 warn()  { printf "${YEL}${BLD}[提示]${RST} %s\n" "$1"; }
 err()   { printf "${RED}${BLD}[错误]${RST} %s\n" "$1"; }
+
+# 给可能长时间卡住的网络命令加超时上限（没有 timeout 命令时退化为直接执行）。
+# npm 在源不可达时经常连 TCP 都不超时，表现为"界面就停在那里"。
+run_timed() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+NPM_QUICK_TIMEOUT=60    # 只查一下版本的命令
+NPM_INSTALL_TIMEOUT=900 # 真正下载安装的步骤
+
+# 就地修改文本。不用 sed -i：
+#   · GNU sed -i 会把软链替换成普通文件（真身不变，改动"丢"在副本里）；
+#   · BSD sed 又要求 -i ''，写法不通用。
+# 统一"写同目录临时文件再 mv"，并先解析软链真身、保留原权限位。
+# 用法：sed_inplace <文件> <sed 参数...>
+sed_inplace() {
+    local file="$1"; shift
+    local target dir tmp
+    target=$(readlink -f "$file" 2>/dev/null) || target="$file"
+    [ -f "$target" ] || return 0
+    dir=$(dirname "$target")
+    tmp=$(mktemp "$dir/.dsh-sed.XXXXXX" 2>/dev/null) || return 1
+    if sed "$@" "$target" > "$tmp" 2>/dev/null; then
+        chmod --reference="$target" "$tmp" 2>/dev/null || true
+        if mv -f "$tmp" "$target" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
 title() { printf "\n${BLD}==== %s ====${RST}\n" "$1"; }
 
 # ========== systemctl 封装 ==========
@@ -80,6 +117,17 @@ journal_cmd() {
     else
         printf 'sudo journalctl'
     fi
+}
+
+# 读取 systemd 单元属性。--value 需要 systemd ≥ 230，老系统上会直接报错，
+# 结果被 tr 成空串 —— "运行中"于是被误报成"未运行"。这里做一次回退解析。
+svc_prop() {
+    local prop="$1" out=""
+    out=$(sysctl show -p "$prop" --value "$SVC" 2>/dev/null)
+    if [ -z "$out" ]; then
+        out=$(sysctl show -p "$prop" "$SVC" 2>/dev/null | grep -m1 "^${prop}=" | cut -d= -f2-)
+    fi
+    printf '%s\n' "$out"
 }
 
 is_run() {
@@ -196,7 +244,8 @@ fetch_to_file() {
         curl -fsSL --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
             --max-time "$SCRIPT_MAX_TIME" -o "$out" -- "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -T 60 -O "$out" "$url"
+        # -T 与 curl 的 --max-time 保持一致；-- 同样是挡 "-开头被当选项"
+        wget -q -T "$SCRIPT_MAX_TIME" -O "$out" -- "$url"
     else
         return 127
     fi
@@ -277,7 +326,11 @@ install_node_via_nodesource() {
     esac
 
     # 先下载再执行，不用 curl | bash：这样下载失败/内容被替换时能自己判断
-    local tmp="/tmp/nodesource_setup_${major}.x.sh"
+    # 必须用 mktemp：固定路径 /tmp/nodesource_setup_N.x.sh 可被本机任何用户
+    # 预先建成指向 /etc/sudoers.d/... 的软链，curl -o 会覆写该目标，
+    # 随后 bash 以 root 执行 → 任意文件覆写 + root 代码执行
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || { err "无法创建临时文件"; return 1; }
     echo
     echo "正在下载 NodeSource 源配置脚本：$base"
     if ! fetch_to_file "$base" "$tmp"; then
@@ -440,7 +493,7 @@ install_or_update_dsh() {
     # ---------- 查询最新版本 ----------
     echo "正在查询 npm 上的最新版本..."
     local latest_version=""
-    latest_version=$(npm view @deepseek-ai/dsh version 2>/dev/null)
+    latest_version=$(run_timed "$NPM_QUICK_TIMEOUT" npm view @deepseek-ai/dsh version 2>/dev/null)
     if [ -n "$latest_version" ]; then
         echo "最新版本：$latest_version"
     else
@@ -497,7 +550,7 @@ install_or_update_dsh() {
     # （sudo 后 PATH 里没有那个 npm，且会装到错误位置）。
     local npm_prefix=""
     local npm_need_sudo=0
-    npm_prefix=$(npm prefix -g 2>/dev/null)
+    npm_prefix=$(run_timed "$NPM_QUICK_TIMEOUT" npm prefix -g 2>/dev/null)
     if [ "$(id -u)" -ne 0 ]; then
         if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
             npm_need_sudo=0
@@ -509,9 +562,9 @@ install_or_update_dsh() {
     if [ "$npm_need_sudo" -eq 1 ]; then
         echo "（npm 全局前缀 ${npm_prefix:-未知} 当前用户不可写，将使用 sudo）"
         echo
-        sudo npm install -g @deepseek-ai/dsh 2>&1 || ret=$?
+        run_timed "$NPM_INSTALL_TIMEOUT" sudo npm install -g @deepseek-ai/dsh 2>&1 || ret=$?
     else
-        npm install -g @deepseek-ai/dsh 2>&1 || ret=$?
+        run_timed "$NPM_INSTALL_TIMEOUT" npm install -g @deepseek-ai/dsh 2>&1 || ret=$?
     fi
     
     if [ $ret -ne 0 ]; then
@@ -757,6 +810,49 @@ download_self_update() {
     return 1
 }
 
+# ---------- 用新脚本替换自身 ----------
+# 优先原子替换：先落同目录临时文件，再 rename 覆盖
+# （脚本正在运行，rename 不会打断当前进程）。
+# 目录不可写时回退为直接覆盖内容 —— 那是"先截断再写"，中途失败会留下
+# 半截脚本，所以没有可用备份时绝不走这条路。
+# 用法：replace_self_script <自身路径> <新脚本临时文件> <备份路径> <备份是否成功0/1>
+replace_self_script() {
+    local SELF="$1" TMP="$2" BAK="$3" bak_ok="${4:-0}"
+    local STAGED="${SELF}.new.$$" replaced=0
+
+    if install -m 0755 "$TMP" "$STAGED" 2>/dev/null && mv -f "$STAGED" "$SELF" 2>/dev/null; then
+        replaced=1
+    else
+        rm -f "$STAGED" 2>/dev/null
+        if [ "$bak_ok" -ne 1 ]; then
+            err "目录不可写且备份失败，已中止（原脚本未改动）"
+            rm -f "$TMP"
+            return 1
+        fi
+        warn "回退为直接覆盖文件内容（非原子，中途失败可能损坏脚本）"
+        # 覆盖后必须校验第一行仍是 shebang —— 写了一半会连解释器都认不出来
+        if cat -- "$TMP" > "$SELF" 2>/dev/null && head -n 1 "$SELF" 2>/dev/null | grep -q '^#!'; then
+            chmod 0755 "$SELF" 2>/dev/null || true
+            replaced=1
+        fi
+    fi
+    rm -f "$TMP"
+
+    if [ "$replaced" -ne 1 ]; then
+        # 直接覆盖失败时文件可能已被截断，能回退就回退，
+        # 不能回退就如实说"可能已损坏"，而不是一句"原脚本未受影响"
+        if [ "$bak_ok" -eq 1 ] && [ -s "$BAK" ] && cp -p "$BAK" "$SELF" 2>/dev/null; then
+            err "替换失败，已从备份恢复原脚本"
+        else
+            err "替换失败，$SELF 可能已损坏"
+            echo "  备份：${BAK}$([ "$bak_ok" -eq 1 ] && echo "（可用它恢复）" || echo "（未成功创建）")"
+            echo "  手动重装：curl -fsSL $RAW_BASE/install.sh | bash"
+        fi
+        return 1
+    fi
+    return 0
+}
+
 # ========== 更新管理脚本自身（菜单 00） ==========
 update_self() {
     title "更新管理脚本"
@@ -774,6 +870,14 @@ update_self() {
     
     echo "脚本路径：$SELF"
     echo "当前版本：$SCRIPT_VERSION"
+
+    # HOME/USER 决定数据目录与 systemd 的 User=：sudo 之后它们会变成 root 的，
+    # 而用户的数据可能在 /home/xxx/.dsh —— 不说清楚会表现为"对话全没了"
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        warn "当前以 root 身份运行（原用户：$SUDO_USER）"
+        echo "      数据目录按 root 的家目录算：$HOME/.dsh"
+        echo "      若你的数据在 /home/$SUDO_USER/.dsh，请退出后用该用户运行本脚本。"
+    fi
     
     # 权限检查：实现是先在本目录建 "$SELF.new.$$" 再 mv 覆盖，
     # 所以真正需要的是"目录可写"，只判断文件本身可写会误判
@@ -795,6 +899,7 @@ update_self() {
         err "无法创建临时文件"
         return 1
     }
+    register_tmp_dir "$TMP"
     
     local dr=0
     download_self_update "$TMP" || dr=$?
@@ -862,32 +967,15 @@ update_self() {
     
     # 备份当前版本
     local BAK="${SELF}.bak"
+    local bak_ok=0
     if cp -p "$SELF" "$BAK" 2>/dev/null; then
+        bak_ok=1
         echo "已备份：$BAK"
     else
-        warn "备份失败，继续更新"
+        warn "备份失败（${BAK}）"
     fi
-    
-    # 先落到同目录的临时文件，再 rename 覆盖，保证原子替换
-    # （脚本正在运行，rename 不会打断当前进程）
-    # 优先原子替换：先落同目录临时文件，再 rename 覆盖
-    # （脚本正在运行，rename 不会打断当前进程）。
-    # 目录不可写时回退为直接覆盖内容 —— 非原子，但那是唯一可行方式。
-    local STAGED="${SELF}.new.$$"
-    local replaced=0
-    if install -m 0755 "$TMP" "$STAGED" 2>/dev/null && mv -f "$STAGED" "$SELF" 2>/dev/null; then
-        replaced=1
-    else
-        rm -f "$STAGED" 2>/dev/null
-        if cat -- "$TMP" > "$SELF" 2>/dev/null; then
-            chmod 0755 "$SELF" 2>/dev/null || true
-            replaced=1
-        fi
-    fi
-    rm -f "$TMP"
-    
-    if [ $replaced -ne 1 ]; then
-        err "替换失败，原脚本未受影响"
+
+    if ! replace_self_script "$SELF" "$TMP" "$BAK" "$bak_ok"; then
         return 1
     fi
     
@@ -909,7 +997,11 @@ update_self() {
 # ========== 永久把 SVC 写入本脚本文件 ==========
 write_svc_to_script() {
     local NEW="$1"
-    local SCRIPT_FILE="$0"
+    # 必须用 realpath：$0 可能是 /usr/bin/dsh-manager 这种软链，
+    # 而 GNU sed -i 会把软链替换成普通文件（真身不变），
+    # 结果只改了副本、服务名没真正持久化
+    local SCRIPT_FILE
+    SCRIPT_FILE=$(get_self_path)
     
     # 检查文件是否存在
     if [ ! -f "$SCRIPT_FILE" ]; then
@@ -928,9 +1020,9 @@ write_svc_to_script() {
     local BACKUP_FILE="${SCRIPT_FILE}.backup"
     cp "$SCRIPT_FILE" "$BACKUP_FILE" 2>/dev/null
     
-    # 更新配置
-    sed -i "s/^SVC=\".*\"/SVC=\"$NEW\"/" "$SCRIPT_FILE"
-    if [ $? -eq 0 ]; then
+    # 更新配置。sed 即使一行都没匹配也返回 0，所以要回读确认真的改了
+    sed_inplace "$SCRIPT_FILE" "s/^SVC=\".*\"/SVC=\"$NEW\"/"
+    if [ $? -eq 0 ] && grep -q "^SVC=\"$NEW\"$" "$SCRIPT_FILE"; then
         info "已将新服务名永久写入脚本文件"
         # 删除备份文件
         rm -f "$BACKUP_FILE" 2>/dev/null
@@ -982,7 +1074,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=$USER
+User=${USER:-$(id -un)}
 ExecStart=$USE_DSH_BIN web --host 127.0.0.1 --port $DSH_PORT
 Restart=on-failure
 RestartSec=5
@@ -998,7 +1090,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=$USER
+User=${USER:-$(id -un)}
 ExecStart=$USE_DSH_BIN web --host 127.0.0.1 --port $DSH_PORT
 Restart=on-failure
 RestartSec=5
@@ -1008,9 +1100,21 @@ WantedBy=multi-user.target
 EOF
     fi
 
+    # 写入结果必须校验：非 root 且 sudo 失败 / 磁盘满 / /etc 只读时，
+    # unit 根本没落盘，以前照样打印"初始化成功"
+    if [ ! -f "$UNIT" ]; then
+        err "服务文件写入失败：$UNIT"
+        echo "  请检查权限（本操作需要 root）后重试"
+        return 1
+    fi
+
     sysctl daemon-reload
-    sysctl enable "$SVC" >/dev/null 2>&1
-    info "初始化成功！可直接启动服务"
+    if sysctl enable "$SVC" >/dev/null 2>&1; then
+        info "初始化成功！可直接启动服务"
+    else
+        warn "服务文件已创建，但设置开机自启失败"
+        echo "  可稍后手动执行：systemctl enable $SVC"
+    fi
 }
 
 # ========== 启动 ==========
@@ -1064,7 +1168,7 @@ get_url() {
     # 否则服务刚重启、新 token 还没打印时，日志里最后一次匹配到的
     # 是上一次运行的旧 token，会拿着一个已失效的链接告诉用户可用。
     local PID=""
-    PID=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+    PID=$(svc_prop MainPID | tr -d ' ')
 
     local JC
     if [ "$(id -u)" -eq 0 ]; then
@@ -1222,12 +1326,24 @@ uninstall_svc() {
     fi
     sysctl stop "$SVC" >/dev/null 2>&1
     sysctl disable "$SVC" >/dev/null 2>&1
+
+    local rm_ok=0
     if [ "$(id -u)" -eq 0 ];then
-        rm -f "$UNIT"
+        rm -f "$UNIT" && rm_ok=1
     else
-        sudo rm -f "$UNIT"
+        sudo rm -f "$UNIT" && rm_ok=1
     fi
+
+    if [ "$rm_ok" -ne 1 ] || [ -f "$UNIT" ]; then
+        err "服务文件删除失败：$UNIT"
+        echo "  请以 root 手动删除，或检查文件是否被保护（chattr +i 等）"
+        return 1
+    fi
+
     sysctl daemon-reload
+    if is_run 2>/dev/null; then
+        warn "服务文件已删除，但进程似乎仍在运行，请确认：systemctl status $SVC"
+    fi
     info "✅ systemd服务已卸载，dsh二进制文件保留"
 }
 
@@ -1277,7 +1393,7 @@ uninstall_dsh() {
     
     # 与安装一致：按 npm 全局前缀是否可写决定要不要 sudo
     local npm_prefix="" npm_need_sudo=0
-    npm_prefix=$(npm prefix -g 2>/dev/null)
+    npm_prefix=$(run_timed "$NPM_QUICK_TIMEOUT" npm prefix -g 2>/dev/null)
     if [ "$(id -u)" -ne 0 ]; then
         if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
             npm_need_sudo=0
@@ -1290,9 +1406,9 @@ uninstall_dsh() {
     echo "正在卸载 DSH 程序本体..."
     local ret=0
     if [ "$npm_need_sudo" -eq 1 ]; then
-        sudo npm uninstall -g @deepseek-ai/dsh 2>&1 || ret=$?
+        run_timed "$NPM_INSTALL_TIMEOUT" sudo npm uninstall -g @deepseek-ai/dsh 2>&1 || ret=$?
     else
-        npm uninstall -g @deepseek-ai/dsh 2>&1 || ret=$?
+        run_timed "$NPM_INSTALL_TIMEOUT" npm uninstall -g @deepseek-ai/dsh 2>&1 || ret=$?
     fi
     
     if [ $ret -ne 0 ]; then
@@ -1324,10 +1440,16 @@ uninstall_dsh() {
 strip_alias_lines() {
     local rc="$1"
     [ -f "$rc" ] || return 0
-    sed -i '/^# DSH 管理脚本快捷命令$/d' "$rc" 2>/dev/null
-    sed -i '/^# DSH-Web 管理脚本快捷命令$/d' "$rc" 2>/dev/null
-    sed -i "/^alias d='bash .*'$/d" "$rc" 2>/dev/null
-    sed -i "/^alias d='$TARGET_NAME'$/d" "$rc" 2>/dev/null
+    # 只删本脚本可能写入的两种形态：
+    #   alias d='dsh-manager'                       （安装器写入）
+    #   alias d='bash .../dsh-manager' 或 .../dsh.sh（旧版/本菜单写入）
+    # 以前用 "alias d='bash .*'" 通配，会连用户自己的
+    # alias d='bash ~/deploy.sh' 一起删掉。
+    sed_inplace "$rc" \
+        -e '/^# DSH 管理脚本快捷命令$/d' \
+        -e '/^# DSH-Web 管理脚本快捷命令$/d' \
+        -e "/^alias d='$TARGET_NAME'$/d" \
+        -e "/^alias d='bash .*\/\(dsh-manager\|dsh\.sh\)'$/d" 2>/dev/null
     return 0
 }
 
@@ -1366,13 +1488,24 @@ uninstall_self() {
     fi
     
     # 软链与 profile 片段
-    [ -L "/usr/bin/$TARGET_NAME" ] && { $rm_sh "/usr/bin/$TARGET_NAME" 2>/dev/null; echo "已删除 /usr/bin/$TARGET_NAME"; }
+    if [ -L "/usr/bin/$TARGET_NAME" ]; then
+        if $rm_sh "/usr/bin/$TARGET_NAME" 2>/dev/null; then
+            echo "已删除 /usr/bin/$TARGET_NAME"
+        else
+            warn "删除失败（权限不足？）：/usr/bin/$TARGET_NAME"
+            echo "  可手动执行：$rm_sh /usr/bin/$TARGET_NAME"
+        fi
+    fi
     [ -f "$PROFILE_FILE" ] && { $rm_sh "$PROFILE_FILE" 2>/dev/null; echo "已删除 $PROFILE_FILE"; }
     
     # ~/.bashrc 中的别名（含调用者用户，避免只清 root 的）
     local login_user="${SUDO_USER:-$(id -un)}"
     local home
     home="$(getent passwd "$login_user" 2>/dev/null | cut -d: -f6 || true)"
+    # 精简系统可能没有 getent，退回直接读 /etc/passwd
+    if [ -z "$home" ] && [ -r /etc/passwd ]; then
+        home=$(awk -F: -v u="$login_user" '$1==u {print $6; exit}' /etc/passwd 2>/dev/null)
+    fi
     if [ -n "$home" ] && [ -f "$home/.bashrc" ]; then
         strip_alias_lines "$home/.bashrc"
         echo "已清理 $home/.bashrc 中的快捷别名"
@@ -1470,6 +1603,30 @@ BACKUP_DIR="$HOME/.dsh/backups"
 # 全局动画进程PID
 ANIMATION_PID=""
 
+# 本脚本创建的临时目录登记表：正常路径各自删除，异常退出（EXIT/TERM）由
+# cleanup_tmp_dirs 兜底，避免在 /tmp 里越堆越多。
+TMP_DIRS=""
+
+register_tmp_dir() {
+    [ -n "$1" ] && TMP_DIRS="$TMP_DIRS $1"
+}
+
+unregister_tmp_dir() {
+    local d out=""
+    for d in $TMP_DIRS; do
+        [ "$d" = "$1" ] || out="$out $d"
+    done
+    TMP_DIRS="$out"
+}
+
+cleanup_tmp_dirs() {
+    local d
+    for d in $TMP_DIRS; do
+        [ -n "$d" ] && rm -rf "$d" 2>/dev/null
+    done
+    TMP_DIRS=""
+}
+
 # 清理函数：杀死所有动画子进程
 cleanup_animation() {
     if [ -n "$ANIMATION_PID" ] && kill -0 "$ANIMATION_PID" 2>/dev/null; then
@@ -1494,24 +1651,56 @@ init_backup_dir() {
 # 验证备份文件完整性
 verify_backup() {
     local backup_file="$1"
+
     if [ ! -f "$backup_file" ]; then
         err "备份文件不存在：$backup_file"
         return 1
     fi
-    
-    # 检查文件大小
-    local file_size=$(stat -c %s "$backup_file" 2>/dev/null)
+
+    local file_size
+    file_size=$(stat -c %s "$backup_file" 2>/dev/null)
+    if ! [[ "${file_size:-}" =~ ^[0-9]+$ ]]; then
+        err "无法读取备份文件大小：$backup_file"
+        return 1
+    fi
     if [ "$file_size" -lt 100 ]; then
         err "备份文件过小，可能损坏：$backup_file"
         return 1
     fi
-    
-    # 尝试列出备份内容
-    if ! tar -tzf "$backup_file" >/dev/null 2>&1; then
+
+    local listing
+    if ! listing=$(tar -tzf "$backup_file" 2>/dev/null); then
         err "备份文件损坏，无法读取：$backup_file"
         return 1
     fi
-    
+
+    # 只验证"能被列出"远远不够：tar 读到正在被写入的文件会以非 0 退出，
+    # 而归档照样列得出来（实测 tar rc=1、tar -tzf rc=0），
+    # 于是残缺归档被报成"备份成功"。这里做两项内容抽查。
+    if ! printf '%s\n' "$listing" | grep -q '\.dsh/sessions/'; then
+        err "备份内不含会话目录，视为失败"
+        return 1
+    fi
+
+    if command -v zstd >/dev/null 2>&1; then
+        local one tmpf
+        one=$(printf '%s\n' "$listing" | grep '\.jsonl\.zstd$' | head -n 1)
+        if [ -n "$one" ]; then
+            tmpf=$(mktemp 2>/dev/null)
+            if [ -n "$tmpf" ]; then
+                if tar -xzOf "$backup_file" "$one" 2>/dev/null > "$tmpf" \
+                   && ! zstd -t "$tmpf" >/dev/null 2>&1; then
+                    rm -f "$tmpf"
+                    err "备份内的会话文件未通过 zstd 完整性校验，备份不完整"
+                    return 1
+                fi
+                rm -f "$tmpf"
+            fi
+        fi
+    else
+        warn "系统未安装 zstd，跳过会话文件完整性抽查"
+    fi
+
     return 0
 }
 
@@ -1534,7 +1723,7 @@ generate_backup_filename() {
 # ---------- 备份类型：前缀即类型，列表/清理都靠它区分 ----------
 # dialogue = 仅对话记录；data = 对话+插件+配置；full = 完整
 # sessions 是 1.5.3 以前的旧前缀（当时内容其实等于 data），保留兼容
-BACKUP_PREFIXES="dsh_dialogue_backup|dsh_data_backup|dsh_sessions_backup|dsh_full_backup|dsh_plugins_backup"
+BACKUP_PREFIXES="dsh_dialogue_backup|dsh_data_backup|dsh_sessions_backup|dsh_full_backup|dsh_plugins_backup|dsh_prerestore"
 
 # 由文件名判断备份类型，给用户看的短标签
 backup_kind() {
@@ -1543,6 +1732,7 @@ backup_kind() {
         dsh_data_backup*|dsh_sessions_backup*) echo "对话+插件" ;;
         dsh_full_backup*)     echo "完整" ;;
         dsh_plugins_backup*)  echo "插件清单" ;;
+        dsh_prerestore*)      echo "恢复前快照" ;;
         *)                    echo "未知" ;;
     esac
 }
@@ -1636,6 +1826,7 @@ backup_group_order() {
         dsh_dialogue_backup*)                  echo 2 ;;
         dsh_data_backup*|dsh_sessions_backup*) echo 3 ;;
         dsh_plugins_backup*)                   echo 4 ;;
+        dsh_prerestore*)                       echo 5 ;;
         *)                                     echo 9 ;;
     esac
 }
@@ -1644,7 +1835,9 @@ backup_group_order() {
 # 用稳定排序保住 list_backups 的时间序，避免"组内又乱掉"。
 list_backups_grouped() {
     local f
-    for f in $(list_backups); do
+    # 逐行读，不靠词分割 —— 文件名里若有空格/通配符会被拆错
+    list_backups | while IFS= read -r f; do
+        [ -n "$f" ] || continue
         printf '%s|%s\n' "$(backup_group_order "$f")" "$f"
     done | sort -s -t'|' -k1,1n | cut -d'|' -f2-
 }
@@ -1722,32 +1915,87 @@ print_backup_groups() {
 pack_dsh_backup() {
     local out="$1"; shift
     local temp_dir
-    temp_dir=$(mktemp -d) || { err "无法创建临时目录"; return 1; }
-    mkdir -p "$temp_dir/.dsh" || { rm -rf "$temp_dir"; err "无法创建临时目录结构"; return 1; }
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/dsh-manager-tmp.XXXXXX") \
+        || { err "无法创建临时目录"; return 1; }
+    register_tmp_dir "$temp_dir"
+    mkdir -p "$temp_dir/.dsh" || { rm -rf "$temp_dir"; unregister_tmp_dir "$temp_dir"; err "无法创建临时目录结构"; return 1; }
 
-    local item src dst
+    local item src dst rc=0 copied=0
     for item in "$@"; do
         src="$HOME/.dsh/$item"
         [ -e "$src" ] || continue
         dst="$temp_dir/.dsh/$item"
         mkdir -p "$(dirname "$dst")"
+
         if [ -d "$src" ]; then
             if command -v rsync >/dev/null 2>&1; then
-                rsync -a --exclude='.cache' "$src/" "$dst/" 2>/dev/null
+                if ! rsync -a --exclude='.cache' "$src/" "$dst/" 2>/dev/null; then
+                    err "复制失败：$item"
+                    rc=1
+                    continue
+                fi
             else
+                # 无 rsync 时用 tar 管道。注意两点：
+                #   1) busybox 的 tar 不认 --exclude，所以这里不做排除，
+                #      缓存目录复制完再删（以前加了 --exclude，busybox 直接
+                #      报错 → 复制全失败 → 却产出"空归档"并报成功）
+                #   2) 只看整条管道的返回值会漏掉"生产者失败、消费者正常结束"，
+                #      必须用 PIPESTATUS 取生产者状态（脚本没有 pipefail）
                 mkdir -p "$dst"
-                tar -cf - -C "$src" --exclude='.cache' . 2>/dev/null \
-                    | tar -xf - -C "$dst" 2>/dev/null
+                tar -cf - -C "$src" . 2>/dev/null | tar -xf - -C "$dst" 2>/dev/null
+                if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+                    err "复制失败：$item（tar 读取端返回非 0）"
+                    rc=1
+                    continue
+                fi
+                while IFS= read -r d; do rm -rf "$d"; done < <(find "$dst" -type d -name .cache 2>/dev/null)
+            fi
+            # 源里明明有东西、目标却空 —— 这就是"静默空归档"的现场
+            if [ -n "$(ls -A "$src" 2>/dev/null)" ] && [ -z "$(ls -A "$dst" 2>/dev/null)" ]; then
+                err "复制结果为空：$item"
+                rc=1
+                continue
             fi
         else
-            cp "$src" "$dst" 2>/dev/null
+            if ! cp "$src" "$dst" 2>/dev/null; then
+                err "复制失败：$item"
+                rc=1
+                continue
+            fi
         fi
+        copied=$((copied + 1))
     done
 
+    if [ "$rc" -ne 0 ]; then
+        rm -rf "$temp_dir"; unregister_tmp_dir "$temp_dir"
+        return 1
+    fi
+    if [ "$copied" -eq 0 ]; then
+        err "没有任何数据被复制（检查 HOME 是否为 ${HOME:-空}、~/.dsh 是否存在）"
+        rm -rf "$temp_dir"; unregister_tmp_dir "$temp_dir"
+        return 1
+    fi
+
     tar -czf "$out" -C "$temp_dir" .dsh 2>/dev/null
-    local rc=$?
-    rm -rf "$temp_dir"
+    rc=$?
+    rm -rf "$temp_dir"; unregister_tmp_dir "$temp_dir"
     return $rc
+}
+
+# 完整备份要包含哪些顶层条目：排除插件（profiles）、历史备份自身
+# （backups，否则体积指数增长）、缓存与遥测。
+# 单独成函数是为了能把"包含/排除"这件事测出来。
+full_backup_items() {
+    local dsh_dir="${1:-$HOME/.dsh}"
+    local e b
+    for e in "$dsh_dir"/* "$dsh_dir"/.[!.]*; do
+        [ -e "$e" ] || continue
+        b=$(basename "$e")
+        case "$b" in
+            profiles|backups|cache|telemetry|.cache) continue ;;
+        esac
+        printf '%s\n' "$b"
+    done
 }
 
 # 备份时的点状进度动画（前台跑，结束由 cleanup_animation 收）
@@ -1775,7 +2023,8 @@ list_backups() {
 # 备份现状摘要，供菜单和备份类型屏复用
 # 输出三行：数量体积 / 最近一次（时间 类型）
 backup_status_lines() {
-    local files=($(list_backups_data))
+    local -a files=()
+    while IFS= read -r _bf; do [ -n "$_bf" ] && files+=("$_bf"); done < <(list_backups_data)
     if [ ${#files[@]} -eq 0 ]; then
         printf '还没有备份\n—\n'
         return 0
@@ -1844,7 +2093,7 @@ ensure_pnpm() {
     fi
     if [ $ret -ne 0 ] && command -v npm >/dev/null 2>&1; then
         echo "正在用 npm 安装 pnpm..."
-        if npm install -g pnpm 2>&1; then
+        if run_timed "$NPM_INSTALL_TIMEOUT" npm install -g pnpm 2>&1; then
             ret=0
         fi
     fi
@@ -1897,7 +2146,7 @@ mem_diag() {
     echo
 
     local PID VSZ RSS
-    PID=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+    PID=$(svc_prop MainPID | tr -d ' ')
     if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/status" ]; then
         VSZ=$(awk '/^VmSize:/{print $2}' "/proc/$PID/status" 2>/dev/null)
         RSS=$(awk '/^VmRSS:/{print $2}' "/proc/$PID/status" 2>/dev/null)
@@ -1979,7 +2228,10 @@ profile_bundles_edit() {
     local pj
     pj=$(profile_manifest "$1")
     [ -f "$pj" ] || { err "找不到 $pj"; return 1; }
-    backup_file_unique "$pj" >/dev/null
+    if ! backup_file_unique "$pj" >/dev/null; then
+        err "无法备份 $pj，已中止（改坏了没法回退）"
+        return 1
+    fi
     node -e '
       const fs = require("fs");
       const [file, name, action] = process.argv.slice(1);
@@ -1992,7 +2244,11 @@ profile_bundles_edit() {
       } else {
         d.dsh.profile.bundles = b.filter((x) => x !== name);
       }
-      fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
+      // 先写临时文件再 rename：writeFileSync 直接覆盖会先截断，
+      // 中途断电/满盘就留下一个残缺 JSON，DSH 直接起不来
+      const tmp = file + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(d, null, 2) + "\n");
+      fs.renameSync(tmp, file);
     ' "$pj" "$2" "$3" 2>/dev/null || { err "写入失败"; return 1; }
     return 0
 }
@@ -2027,8 +2283,22 @@ approve_ignored_builds() {
         echo "可手动执行：cd $(dirname "$f") && pnpm approve-builds"
         return 1
     fi
-    backup_file_unique "$f" >/dev/null
-    sed -i 's/: *set this to true or false *$/: true/' "$f"
+    if ! backup_file_unique "$f" >/dev/null; then
+        err "无法备份 $f，已中止"
+        return 1
+    fi
+    # sed -i 也是"写临时文件再替换"，但失败语义不明确；这里显式走 tmp + mv
+    local tmpf="${f}.tmp.$$"
+    if ! sed 's/: *set this to true or false *$/: true/' "$f" > "$tmpf" 2>/dev/null; then
+        rm -f "$tmpf"
+        err "改写失败：$f"
+        return 1
+    fi
+    if [ ! -s "$tmpf" ] || ! mv -f "$tmpf" "$f" 2>/dev/null; then
+        rm -f "$tmpf"
+        err "写入失败：$f"
+        return 1
+    fi
     if grep -q 'set this to true or false' "$f"; then
         err "仍有未放行的条目，请手动执行 pnpm approve-builds"
         return 1
@@ -2130,7 +2400,7 @@ plugin_manifest_lines() {
     ' "$pdir" 2>/dev/null
 }
 
-# ========== 插件清单导出（菜单 8 → 第 3 种备份） ==========
+# ========== 插件清单导出（主菜单 7 → 5「备份插件列表」） ==========
 # 只记"装了什么、什么版本"，不搬插件代码。原因：
 #   · 插件代码是 registry 上可重新下载的派生品，不是不可替代的数据；
 #   · 跨 DSH 版本恢复旧插件代码，正是"插件忽然跑不起来"的成因
@@ -2277,9 +2547,14 @@ restore_plugin_manifest() {
         echo "注意：会覆盖 $pdir/cordis.patch.yml 当前内容"
         read -r -p "写回补丁层？(y/N): " CONFIRM || CONFIRM=""
         if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-            printf '%s\n' "$patch" > "$pdir/cordis.patch.yml" \
-                && info "已写回 cordis.patch.yml" \
-                || err "写入失败"
+            # 这份补丁层通常是用户手写的，且没有别处副本 —— 覆盖前必须先备份
+            if backup_file_unique "$pdir/cordis.patch.yml" >/dev/null 2>&1; then
+                printf '%s\n' "$patch" > "$pdir/cordis.patch.yml" \
+                    && info "已写回 cordis.patch.yml（原文件另存 .bak-*）" \
+                    || err "写入失败"
+            else
+                err "备份原 cordis.patch.yml 失败，已中止（不覆盖用户手写内容）"
+            fi
         fi
     fi
 
@@ -2292,7 +2567,19 @@ restore_plugin_manifest() {
 # 备份 DSH 数据
 backup_sessions() {
     title "备份 DSH 数据"
-    
+
+    # HOME 为空时 "$HOME/.dsh" 会变成 "/.dsh"，以前会"成功"备份出一个空归档
+    if [ -z "${HOME:-}" ] || [ ! -d "$HOME/.dsh" ]; then
+        err "无法确定 DSH 数据目录（HOME=${HOME:-空}，或 ~/.dsh 不存在）"
+        return 1
+    fi
+    # 没有 sessions 时归档必然缺会话目录，与其等到 verify 报"不含会话目录"，
+    # 不如在这里把原因说清楚
+    if [ ! -d "$HOME/.dsh/sessions" ]; then
+        err "没有会话数据可备份（$HOME/.dsh/sessions 不存在）"
+        return 1
+    fi
+
     # 检查 DSH 是否安装
     if ! check_dsh_installed; then
         err "DSH 未安装，无法备份"
@@ -2325,6 +2612,7 @@ backup_sessions() {
     read -r -p "请选择： " BACKUP_TYPE
 
     local backup_file=""
+    local backup_result=0
     case $BACKUP_TYPE in
         1)
             # ---------- 仅对话记录 ----------
@@ -2349,7 +2637,13 @@ backup_sessions() {
                 sessions \
                 storages/workspace.json \
                 storages/session_projcache
+            backup_result=$?
             cleanup_animation
+            if [ "$backup_result" -ne 0 ]; then
+                rm -f "$backup_file"
+                err "备份失败，已删除半成品归档"
+                return 1
+            fi
             ;;
         2)
             # ---------- 完整备份（数据） ----------
@@ -2366,25 +2660,34 @@ backup_sessions() {
             echo "- 附件 (attachments/)"
             echo "- 设置、登录凭据、集成与模型配置"
             echo
-            echo "不含插件（profiles/）；插件请用第 3 种「插件清单」备份"
+            echo "不含插件（profiles/）；插件请用 主菜单 7 → 5「备份插件列表」"
             echo "排除：profiles/、backups/、cache/、telemetry/"
             echo
 
+            # 不再让 tar 自己排除：busybox 的 tar 既不认 --exclude 也不认 -X，
+            # 老写法在精简系统上会直接失败（旧版更糟——退出码被丢掉，
+            # 于是"打包失败"被报成"备份成功"）。这里改成先算出要包含的
+            # 顶层条目，再走与其它备份相同的复制+打包逻辑。
+            local -a _items=()
+            while IFS= read -r _e; do
+                [ -n "$_e" ] && _items+=("$_e")
+            done < <(full_backup_items)
+            if [ "${#_items[@]}" -eq 0 ]; then
+                err "没找到可备份的数据目录（~/.dsh 是空的？）"
+                return 1
+            fi
+            echo "包含：${_items[*]}"
+            echo
+
             start_backup_animation "正在创建完整备份"
-            # 注意：GNU tar 的 --exclude 是位置相关选项，必须写在操作数
-            # .dsh 之前，写在后面会被直接忽略。旧版就写在了后面，
-            # 结果 backups/（历次备份自身）和 cache/ 一直被塞进包里。
-            # .cache 不带斜杠写：GNU tar 默认非锚定匹配，能命中任意深度的
-            # 同名目录（与 rsync --exclude='.cache' 一致）；写成
-            # .dsh/profiles/*/.cache 反而只能匹配一层深，深层排除不掉。
-            tar -czf "$backup_file" -C "$HOME" \
-                --exclude='.dsh/profiles' \
-                --exclude='.dsh/backups' \
-                --exclude='.dsh/cache' \
-                --exclude='.dsh/telemetry' \
-                --exclude='.cache' \
-                .dsh 2>/dev/null
+            pack_dsh_backup "$backup_file" "${_items[@]}"
+            backup_result=$?
             cleanup_animation
+            if [ "$backup_result" -ne 0 ]; then
+                rm -f "$backup_file"
+                err "备份失败，已删除半成品归档"
+                return 1
+            fi
             ;;
         0)
             warn "操作已取消"
@@ -2401,9 +2704,11 @@ backup_sessions() {
         return 1
     fi
 
-    # 验证数据归档完整性
+    # 验证数据归档完整性；不通过就删掉残缺归档，
+    # 否则它会留在列表里冒充一份可用的备份
     if ! verify_backup "$backup_file"; then
-        err "备份文件验证失败"
+        err "备份验证失败，已删除这个不完整的归档"
+        rm -f "$backup_file"
         return 1
     fi
 
@@ -2411,7 +2716,9 @@ backup_sessions() {
     echo "类型：$(backup_kind "$backup_file")"
     echo "文件：$(basename "$backup_file")"
     echo "大小：$(du -h "$backup_file" | cut -f1)"
-    echo "会话：$(find "$dsh_dir/sessions" -name '*.jsonl.zstd' 2>/dev/null | wc -l) 个"
+    # 数归档里的会话，而不是源目录 —— 以前数源目录，
+    # 归档是空的时候也会显示"会话：N 个"
+    echo "会话：$(tar -tzf "$backup_file" 2>/dev/null | grep -c '\.jsonl\.zstd$') 个"
 }
 
 # 恢复 DSH 数据
@@ -2471,9 +2778,9 @@ restore_sessions() {
     echo "（不含插件；插件请用「插件清单」备份恢复）"
     echo
     echo "重要提示："
-    echo "1. 建议在恢复前停止 DSH 服务：systemctl stop dsh-web"
-    echo "2. 恢复后重启 DSH 服务：systemctl restart dsh-web"
-    echo "3. 此操作会覆盖当前所有数据，请确保已备份重要信息"
+    echo "1. 服务若在运行会先询问你并自动停止（恢复必须在停机状态下做）"
+    echo "2. 恢复前会自动创建一份快照，放错了可以回退"
+    echo "3. 恢复后需要重启服务：systemctl restart $SVC"
     echo
     read -r -p "确认恢复？(y/N): " CONFIRM
     
@@ -2488,8 +2795,43 @@ restore_sessions() {
         err "DSH 目录不存在：$dsh_dir"
         return 1
     fi
-    
+
+    # ---------- 恢复前：必须停服务 ----------
+    # 活着的 DSH 进程持有 sessions/storages 的句柄：备份之后产生的新对话会被
+    # 旧内容覆盖（不可逆），进程还会按旧偏移续写，可能把刚恢复的文件写坏。
+    if is_run; then
+        warn "DSH 服务正在运行 —— 恢复会覆盖它正在读写的文件，必须先停止"
+        read -r -p "现在停止服务并继续？(y/N): " CONFIRM || CONFIRM=""
+        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+            warn "已取消（未做任何改动）"
+            return 0
+        fi
+        echo "正在停止服务..."
+        sysctl stop "$SVC"
+        sleep 2
+        if is_run; then
+            err "服务仍在运行，已中止恢复（未做任何改动）"
+            echo "  请手动停止后重试：systemctl stop $SVC"
+            return 1
+        fi
+        info "服务已停止"
+        echo
+    fi
+
+    # ---------- 恢复前：留一个回退点 ----------
+    # 恢复是就地覆盖：万一恢复错了（拿旧备份盖掉新数据），
+    # 没有这个快照就只能靠备份本身，而备份正是要覆盖进去的那份。
+    local pre_snapshot="${BACKUP_DIR}/dsh_prerestore_$(date +%Y%m%d_%H%M%S).tar.gz"
+    echo "正在创建恢复前快照..."
+    if ! pack_dsh_backup "$pre_snapshot" sessions storages settings.yaml; then
+        rm -f "$pre_snapshot"
+        err "恢复前快照失败，已中止（不敢在没有回退点的情况下覆盖现有数据）"
+        return 1
+    fi
+    info "恢复前快照：$(basename "$pre_snapshot")"
+    echo "  如需回退：主菜单 8 → 2 选择它（类型显示为「恢复前快照」）"
     echo
+
     echo "正在恢复 DSH 数据..."
     
     # 恢复备份（带循环点状动画）
@@ -2505,7 +2847,9 @@ restore_sessions() {
     ANIMATION_PID=$!
     
     # 先恢复到临时目录，然后验证完整性
-    local temp_restore_dir=$(mktemp -d)
+    local temp_restore_dir
+    temp_restore_dir=$(mktemp -d "${TMPDIR:-/tmp}/dsh-manager-restore.XXXXXX")
+    register_tmp_dir "$temp_restore_dir"
     if [ ! -d "$temp_restore_dir" ]; then
         cleanup_animation
         err "无法创建临时恢复目录"
@@ -2517,7 +2861,7 @@ restore_sessions() {
     
     if [ $extract_result -ne 0 ]; then
         cleanup_animation
-        rm -rf "$temp_restore_dir"
+        rm -rf "$temp_restore_dir"; unregister_tmp_dir "$temp_restore_dir"
         err "解压备份文件失败"
         return 1
     fi
@@ -2573,7 +2917,10 @@ restore_sessions() {
         # tar 解包本身就是"同名覆盖、其余原样保留"，等价于 rsync 不带 --delete；
         # 旧实现把整个 ~/.dsh 移开再解包、成功后删掉旧的，
         # 那等于"备份里没有的东西全部删除" —— 最小备份会把插件直接抹掉。
-        if ! tar -cf - -C "$temp_restore_dir" .dsh 2>/dev/null | tar -xf - -C "$HOME" 2>/dev/null; then
+        tar -cf - -C "$temp_restore_dir" .dsh 2>/dev/null | tar -xf - -C "$HOME" 2>/dev/null
+        # 只看整条管道会漏掉"生产者失败、消费者正常结束"：
+        # 那样会打印"恢复成功"，实际只恢复了一半
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
             restore_result=1
         fi
     fi
@@ -2582,7 +2929,7 @@ restore_sessions() {
     cleanup_animation
     
     # 清理临时目录
-    rm -rf "$temp_restore_dir"
+    rm -rf "$temp_restore_dir"; unregister_tmp_dir "$temp_restore_dir"
     
     if [ $restore_result -eq 0 ]; then
         printf " 完成\n"
@@ -2641,7 +2988,16 @@ backup_management() {
     read -r -p "请选择： " choice
     
     case $choice in
-        1) clean_backups_batch $(list_backups) ;;   # 按时间序保留"最近N个"
+        1)
+            # 与上面展示的集合保持一致，用数组承载，避免词分割
+            local -a _batch=()
+            while IFS= read -r _f; do [ -n "$_f" ] && _batch+=("$_f"); done < <(list_backups_data)
+            if [ "${#_batch[@]}" -eq 0 ]; then
+                warn "没有可清理的数据备份"
+            else
+                clean_backups_batch "${_batch[@]}"
+            fi
+            ;;
         2) clean_backups_select "${backup_files[@]}" ;;
         3) clean_backups_all ;;
         0) return 0 ;;
@@ -2798,20 +3154,36 @@ clean_backups_all() {
     echo
     echo "=== 删除所有数据备份 ==="
     read -r -p "确认删除所有备份？(y/N): " CONFIRM
-    
+
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         warn "操作已取消"
         return 0
     fi
-    
-    rm -f "$BACKUP_DIR"/dsh_dialogue_backup_*.tar.gz
-    rm -f "$BACKUP_DIR"/dsh_data_backup_*.tar.gz
-    rm -f "$BACKUP_DIR"/dsh_sessions_backup_*.tar.gz
-    rm -f "$BACKUP_DIR"/dsh_full_backup_*.tar.gz
-    
-    info "已删除所有备份"
-}
 
+    # 逐个删并计数：以前是四条 rm 之后无条件喊"已删除所有备份"，
+    # 删没删、删了几个都无从确认，出事后无法追溯
+    local f n=0
+    for f in "$BACKUP_DIR"/dsh_dialogue_backup_*.tar.gz \
+             "$BACKUP_DIR"/dsh_data_backup_*.tar.gz \
+             "$BACKUP_DIR"/dsh_sessions_backup_*.tar.gz \
+             "$BACKUP_DIR"/dsh_full_backup_*.tar.gz \
+             "$BACKUP_DIR"/dsh_prerestore_*.tar.gz; do
+        [ -f "$f" ] || continue
+        echo "  删除 $(basename "$f")"
+        if rm -f "$f" 2>/dev/null; then
+            n=$((n + 1))
+        else
+            err "删除失败：$f"
+        fi
+    done
+
+    info "已删除 $n 个数据备份"
+    local -a left=()
+    while IFS= read -r _lf; do [ -n "$_lf" ] && left+=("$_lf"); done < <(list_backups_plugins)
+    if [ "${#left[@]}" -gt 0 ]; then
+        echo "插件清单 ${#left[@]} 个未动（由 主菜单 7 → 5 管理）"
+    fi
+}
 
 
 # 测试备份恢复
@@ -2864,7 +3236,9 @@ test_backup_restore() {
     fi
     
     # 创建临时目录
-    local temp_dir=$(mktemp -d)
+    local temp_dir
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/dsh-manager-verify.XXXXXX")
+    register_tmp_dir "$temp_dir"
     if [ ! -d "$temp_dir" ]; then
         err "无法创建临时目录"
         return 1
@@ -2897,13 +3271,13 @@ test_backup_restore() {
     fi
     
     # 清理临时目录
-    rm -rf "$temp_dir"
+    rm -rf "$temp_dir"; unregister_tmp_dir "$temp_dir"
     
     echo
     echo "测试完成"
 }
 
-# 备份与恢复（菜单 8：会话 + 插件 + 配置）
+# 备份与恢复（菜单 8：会话 / 完整数据 / 恢复前快照；插件列表在菜单 7 → 5）
 backup_restore_management() {
     # 标题交给循环内的 clear + echo，避免进入时打两遍标题
     while true; do
@@ -2994,7 +3368,10 @@ remove_from_bundles() {
     # 于是 DSH 启动报 cannot resolve profile bundle。
     local pkg="$1"
     [ -f package.json ] || return 1
-    backup_file_unique package.json >/dev/null
+    if ! backup_file_unique package.json >/dev/null; then
+        err "无法备份 package.json，已中止"
+        return 1
+    fi
     node -e '
       const fs = require("fs");
       const [file, name] = process.argv.slice(1);
@@ -3002,7 +3379,11 @@ remove_from_bundles() {
       d.dsh = d.dsh || {};
       d.dsh.profile = d.dsh.profile || {};
       d.dsh.profile.bundles = (d.dsh.profile.bundles || []).filter((x) => x !== name);
-      fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
+      // 先写临时文件再 rename：writeFileSync 直接覆盖会先截断，
+      // 中途断电/满盘就留下一个残缺 JSON，DSH 直接起不来
+      const tmp = file + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(d, null, 2) + "\n");
+      fs.renameSync(tmp, file);
     ' package.json "$pkg" 2>/dev/null
 }
 
@@ -3539,27 +3920,33 @@ remove_alias_from_bashrc() {
     #   2) alias d='dsh-manager'             （安装器写入）
     # 原先只匹配 dsh.sh 字样，安装成 dsh-manager 后永远删不掉。
     local found=0
-    if grep -qF "alias d='bash $SELF_PATH'" "$BASHRC" 2>/dev/null; then
-        found=1
-    elif grep -qF "alias d='$TARGET_NAME'" "$BASHRC" 2>/dev/null; then
-        found=1
-    elif grep -qE "^alias[[:space:]]+d=" "$BASHRC" 2>/dev/null; then
+    if grep -qF "alias d='bash $SELF_PATH'" "$BASHRC" 2>/dev/null \
+       || grep -qF "alias d='$TARGET_NAME'" "$BASHRC" 2>/dev/null; then
         found=1
     fi
-    
+
     if [ $found -eq 0 ]; then
-        warn "未找到 DSH 快捷命令"
+        # 有别的 d 别名也不能删——那不是本脚本写的
+        if grep -qE "^alias[[:space:]]+d=" "$BASHRC" 2>/dev/null; then
+            warn "未找到本脚本写入的快捷命令"
+            echo "  检测到你自己定义的 d 别名，已保持不变。"
+        else
+            warn "未找到 DSH 快捷命令"
+        fi
         return 0
     fi
     
-    # 只删本脚本写入的那几行；不碰用户自己定义的其他 d 别名以外内容
-    sed -i '/^# DSH 管理脚本快捷命令$/d' "$BASHRC"
-    sed -i '/^# DSH-Web 管理脚本快捷命令$/d' "$BASHRC"
-    sed -i "/^alias d='bash .*'$/d" "$BASHRC"
-    sed -i "/^alias d='$TARGET_NAME'$/d" "$BASHRC"
-    
-    # 清掉可能残留的尾部空行
-    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$BASHRC" 2>/dev/null
+    # 只删本脚本写入的那几行；不碰用户自己定义的其他 d 别名以外内容。
+    # 顺手清掉可能残留的尾部空行，一次改完再落盘。
+    if ! sed_inplace "$BASHRC" \
+        -e '/^# DSH 管理脚本快捷命令$/d' \
+        -e '/^# DSH-Web 管理脚本快捷命令$/d' \
+        -e "/^alias d='$TARGET_NAME'$/d" \
+        -e "/^alias d='bash .*\/\(dsh-manager\|dsh\.sh\)'$/d" \
+        -e :a -e '/^\n*$/{$d;N;ba' -e '}' 2>/dev/null; then
+        err "写入 $BASHRC 失败（文件未改动）"
+        return 1
+    fi
     
     info "快捷命令已从 .bashrc 移除"
     echo
@@ -3596,7 +3983,7 @@ quick_start() {
     fi
     # 只有 node 可用时才查得到 npm 上的版本
     if [ $node_ok -eq 1 ]; then
-        latest_ver=$(npm view @deepseek-ai/dsh version 2>/dev/null)
+        latest_ver=$(run_timed "$NPM_QUICK_TIMEOUT" npm view @deepseek-ai/dsh version 2>/dev/null)
     fi
 
     if [ $node_ok -eq 1 ]; then
@@ -3756,9 +4143,9 @@ status_and_logs() {
         # ---------- ① 服务层 ----------
         local ACTIVE="" MAINPID="" RESTARTS="" ENABLED=""
         if [ "$HAS_UNIT" -eq 1 ]; then
-            ACTIVE=$(sysctl show -p ActiveState --value "$SVC" 2>/dev/null | tr -d ' ')
-            MAINPID=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
-            RESTARTS=$(sysctl show -p NRestarts --value "$SVC" 2>/dev/null | tr -d ' ')
+            ACTIVE=$(svc_prop ActiveState | tr -d ' ')
+            MAINPID=$(svc_prop MainPID | tr -d ' ')
+            RESTARTS=$(svc_prop NRestarts | tr -d ' ')
             ENABLED=$(sysctl is-enabled "$SVC" 2>/dev/null)
         fi
 
@@ -3776,7 +4163,7 @@ status_and_logs() {
         local UPTIME_TXT=""
         if [ "$ACTIVE" = "active" ]; then
             local TS EPOCH NOW
-            TS=$(sysctl show -p ActiveEnterTimestamp --value "$SVC" 2>/dev/null)
+            TS=$(svc_prop ActiveEnterTimestamp)
             EPOCH=$(date -d "$TS" +%s 2>/dev/null)
             NOW=$(date +%s)
             # date -d 是 GNU 扩展，busybox 下会失败，此时不显示运行时长即可
@@ -3799,15 +4186,20 @@ status_and_logs() {
         fi
 
         # ---------- ② 业务层：端口 ----------
-        local PORTLINE="" LISTEN=0
+        local PORTLINE="" LISTEN=0 PORTTOOL=""
         if command -v ss >/dev/null 2>&1; then
+            PORTTOOL="ss"
             PORTLINE=$(ss -ltn 2>/dev/null | grep -E "[:.]${DSH_PORT}[[:space:]]" | head -n1)
         elif command -v netstat >/dev/null 2>&1; then
+            PORTTOOL="netstat"
             PORTLINE=$(netstat -ltn 2>/dev/null | grep -E "[:.]${DSH_PORT}[[:space:]]" | head -n1)
         fi
         if [ -n "$PORTLINE" ]; then
             LISTEN=1
             printf "监听    %s\n" "$(printf '%s' "$PORTLINE" | awk '{print $4}')"
+        elif [ -z "$PORTTOOL" ]; then
+            # 没工具就老老实实说不知道，别把"测不出来"报成"没监听"
+            printf "监听    未知（未安装 ss / netstat，无法检测端口）\n"
         else
             printf "监听    端口 %s 未监听\n" "$DSH_PORT"
         fi
@@ -3820,6 +4212,8 @@ status_and_logs() {
             err "结论：服务未运行 —— 主菜单按 2 可启动"
         elif [ "$LISTEN" -eq 1 ]; then
             info "结论：运行正常"
+        elif [ -z "$PORTTOOL" ]; then
+            info "结论：服务在运行（未安装 ss / netstat，端口状态未检测）"
         else
             warn "结论：进程在跑，但端口 $DSH_PORT 未监听（可能在启动中，或监听地址被改过）"
         fi
@@ -3995,7 +4389,8 @@ plugin_manifest_menu() {
         printf '当前 DSH：%s\n' "$(get_dsh_version 2>/dev/null)"
         echo
 
-        local files=($(list_backups_plugins))
+        local -a files=()
+        while IFS= read -r _pf; do [ -n "$_pf" ] && files+=("$_pf"); done < <(list_backups_plugins)
         if [ ${#files[@]} -eq 0 ]; then
             echo "还没有备份过插件列表。"
             echo "备份的是「当时装了哪些插件、什么版本」，约 1KB，不含插件代码。"
@@ -4134,10 +4529,10 @@ menu() {
         STATE_TXT="未初始化"; STATE_COLOR="$YEL"
     else
         local ACTIVE
-        ACTIVE=$(sysctl show -p ActiveState --value "$SVC" 2>/dev/null | tr -d ' ')
+        ACTIVE=$(svc_prop ActiveState | tr -d ' ')
         if [ "$ACTIVE" = "active" ]; then
             STATE_TXT="运行中"
-            PID_TXT=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+            PID_TXT=$(svc_prop MainPID | tr -d ' ')
         elif [ "$ACTIVE" = "failed" ]; then
             STATE_TXT="启动失败"; STATE_COLOR="$RED"
         else
@@ -4177,7 +4572,14 @@ menu() {
 
 # ========== 主循环 ==========
 # 在主循环开始时设置全局信号陷阱
-trap cleanup_animation EXIT INT TERM
+# EXIT：任何路径退出都清理动画子进程
+trap 'cleanup_animation; cleanup_tmp_dirs' EXIT
+# INT：Ctrl+C 只结束当前前台动作（如实时日志）并回到菜单，不退出脚本
+trap cleanup_animation INT
+# TERM：kill / supervisor 停止必须真的停下来 ——
+# 以前 INT/TERM 共用一个"只清理不退出"的处理器，SIGTERM 会被吞掉，
+# 除了 SIGKILL 没有别的办法终止本脚本
+trap 'cleanup_animation; cleanup_tmp_dirs; exit 130' TERM
 
 while true; do
     menu

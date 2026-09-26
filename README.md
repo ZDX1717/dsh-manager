@@ -73,7 +73,7 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.16.0 ====
+==== DSH-Web 管理面板 v1.17.0 ====
 
 DSH   0.1.5-rc.2
 服务  dsh-web  运行中
@@ -129,6 +129,9 @@ DSH   0.1.5-rc.2
 
 恢复只覆盖同名文件、**不删除**目标端已有数据（有无 `rsync` 都是如此）。
 若目标机已有工作区，覆盖前会把 `storages/workspace.json` 另存为 `.bak-<时间>`。
+
+恢复前脚本会先确认服务已停止，再把当前数据快照成 `dsh_prerestore_<时间>.tar.gz`
+（列表里显示为「恢复前快照」）——恢复用错了备份，可以直接拿它回退。
 
 **为什么不备份插件代码**：插件是 registry 上随时可重新下载的派生品，不是不可替代的数据；
 而且每个插件都用 `dsh.compatibility` / `peerDependencies` 声明了它支持的 DSH 版本范围，

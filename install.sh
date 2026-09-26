@@ -46,6 +46,8 @@ GITHUB_API="${DSH_GITHUB_API:-https://api.github.com}"
 INSTALL_DIR="${DSH_INSTALL_DIR:-/usr/local/bin}"
 TARGET_NAME="dsh-manager"
 TARGET_BIN="$INSTALL_DIR/$TARGET_NAME"
+# 兜底软链目录（通常 /usr/local/bin 已在 PATH，这里再补一个 /usr/bin）
+LINK_DIR="${DSH_LINK_DIR:-/usr/bin}"
 ALIAS_NAME="d"
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
 
@@ -57,7 +59,7 @@ CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 # dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
 # 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
 # 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
-PAYLOAD_SHA256="6f0006129982c7fa1d73f88e015bf3636e1364b7c4d8df9cd39c8651e4acfba0"
+PAYLOAD_SHA256="12d70bdc9a64e69181fb136b819950322c76fa8bfec8a0543353d866fb27a94b"
 # 写进 profile 片段的标记行：用于判断"这文件是不是本脚本写的"，
 # 避免把 /etc/passwd 这类无关文件截断成两行 alias
 PROFILE_MARK="# DSH 管理脚本快捷命令"
@@ -262,6 +264,7 @@ DSH 管理脚本安装器
   DSH_RAW_BASE           自定义下载源前缀
   DSH_EXTRA_MIRRORS      追加自定义镜像（空格分隔）
   DSH_INSTALL_DIR        安装目录（默认 /usr/local/bin）
+  DSH_LINK_DIR           兜底软链目录（默认 /usr/bin）
   DSH_GITHUB_API         GitHub API 基地址（解析 commit SHA 用）
   DSH_CONNECT_TIMEOUT    单源连接超时（秒，默认 8）
   DSH_MAX_TIME           单源总超时（秒，默认 30）
@@ -338,7 +341,7 @@ ensure_root() {
 
     warn "当前用户 $(id -un) 非 root，提权后继续"
     local tmp
-    if ! tmp="$(mktemp "${TMPDIR:-/tmp}/dsh-installer.XXXXXX" 2>/dev/null)"; then
+    if ! tmp="$(mktemp "$(tmp_template dsh-installer.XXXXXX)" 2>/dev/null)"; then
         err "无法创建临时文件（检查 TMPDIR 是否可写）：${TMPDIR:-/tmp}"
         exit 1
     fi
@@ -614,6 +617,22 @@ safe_root_dir() {
     return 0
 }
 
+# ---------- 临时目录 ----------
+# mktemp 的模板直接拼 TMPDIR：相对路径会让临时文件落在当前目录，
+# 指向不存在/不可写的目录则直接失败。这里统一收口并给出可读的错误。
+tmp_template() {
+    local name="$1" dir="${TMPDIR:-/tmp}"
+    case "$dir" in
+        /*) ;;
+        *) warn "TMPDIR 不是绝对路径（$dir），临时文件改用 /tmp" ; dir="/tmp" ;;
+    esac
+    if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then
+        [ -n "${TMPDIR:-}" ] && warn "TMPDIR 不可写（$dir），临时文件改用 /tmp"
+        dir="/tmp"
+    fi
+    printf '%s/%s' "$dir" "$name"
+}
+
 # ---------- 安装 ----------
 install_payload() {
     local src="$1"
@@ -637,12 +656,26 @@ install_payload() {
     fi
     info "主脚本安装到 $TARGET_BIN"
 
-    # /usr/local/bin 通常在 PATH 里；补一个 /usr/bin 软链兜底
-    if [ -d /usr/bin ]; then
-        if ln -sf "$TARGET_BIN" "/usr/bin/$TARGET_NAME" 2>/dev/null; then
-            :
-        else
-            warn "无法创建软链 /usr/bin/$TARGET_NAME（不影响使用 $TARGET_BIN）"
+    # /usr/local/bin 通常在 PATH 里；补一个软链兜底（默认 /usr/bin）。
+    # 以前无条件 ln -sf：同名文件会被静默顶掉，别人的东西就没了。
+    if [ -d "$LINK_DIR" ]; then
+        local link="$LINK_DIR/$TARGET_NAME"
+        if [ -e "$link" ] || [ -L "$link" ]; then
+            if [ -L "$link" ] && [ "$(readlink -f "$link" 2>/dev/null)" = "$TARGET_BIN" ]; then
+                : # 已经指向本脚本，无需处理
+            else
+                local stash="${link}.bak-$(date +%Y%m%d_%H%M%S)"
+                if mv -f "$link" "$stash" 2>/dev/null; then
+                    warn "已存在 $link（非本脚本软链），先改名为 $stash"
+                else
+                    warn "已存在 $link 且无法改名，跳过软链创建"
+                fi
+            fi
+        fi
+        if [ ! -e "$link" ] && [ ! -L "$link" ]; then
+            if ! ln -sf "$TARGET_BIN" "$link" 2>/dev/null; then
+                warn "无法创建软链 $link（不影响使用 $TARGET_BIN）"
+            fi
         fi
     fi
 
@@ -768,8 +801,27 @@ done_info() {
     echo "  bash <(curl -sSL $SELF_URL) -y   # 重跑本安装器即可覆盖升级"
     echo
     echo "卸载（也可用管理面板的「卸载」菜单）："
-    echo "  rm -f $TARGET_BIN /usr/bin/$TARGET_NAME $PROFILE_FILE"
+    echo "  rm -f $TARGET_BIN $LINK_DIR/$TARGET_NAME $PROFILE_FILE"
     echo "  再手动删除 ~/.bashrc 里那行：alias $ALIAS_NAME='$TARGET_NAME'"
+}
+
+# ---------- PATH 收紧 ----------
+# 提权后不再信任调用者的 PATH：若标准系统目录里能找到全部必需命令，
+# 就只保留这些目录，避免用户可写目录里的假 curl/tar 被以 root 身份执行。
+harden_path() {
+    # 可选参数：要收紧到的目录列表（默认系统标准目录），便于测试
+    local hardened="${1:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+    local c ok=1
+    for c in curl tar sha256sum mktemp install cp mv; do
+        PATH="$hardened" command -v "$c" >/dev/null 2>&1 || { ok=0; break; }
+    done
+    if [ "$ok" -eq 1 ]; then
+        PATH="$hardened"
+        export PATH
+    else
+        warn "系统标准目录缺少必要命令，保留当前 PATH"
+        warn "请确认其中没有被替换过的程序（可用 command -v curl 检查）"
+    fi
 }
 
 # ---------- 主流程 ----------
@@ -793,7 +845,10 @@ main() {
 
     check_deps
 
-    if ! PAYLOAD_TMP="$(mktemp "${TMPDIR:-/tmp}/dsh-payload.XXXXXX" 2>/dev/null)"; then
+    # 依赖都就位后再收紧 PATH（此时标准目录里一定有 curl/tar）
+    harden_path
+
+    if ! PAYLOAD_TMP="$(mktemp "$(tmp_template dsh-payload.XXXXXX)" 2>/dev/null)"; then
         err "无法创建临时文件（检查 TMPDIR 是否可写）：${TMPDIR:-/tmp}"
         exit 1
     fi
