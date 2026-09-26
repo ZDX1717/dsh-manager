@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.9.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1706,11 +1706,11 @@ backup_plugin_manifest() {
     local pdir="$HOME/.dsh/profiles/$profile"
 
     if [ ! -f "$pdir/package.json" ]; then
-        err "找不到 $pdir/package.json，无法导出插件清单"
+        err "找不到 $pdir/package.json，无法备份插件列表"
         return 1
     fi
     if ! command -v node >/dev/null 2>&1; then
-        err "需要 node 才能读取插件清单"
+        err "需要 node 才能读取插件列表"
         return 1
     fi
 
@@ -1722,8 +1722,8 @@ backup_plugin_manifest() {
     fi
 
     {
-        echo "# DSH 插件清单 —— 由 dsh-manager 生成（不含插件代码）"
-        echo "# 恢复：主菜单 7 → 5 → 2，选中本文件，会按清单逐个重装"
+        echo "# DSH 插件列表备份 —— 由 dsh-manager 生成（不含插件代码）"
+        echo "# 恢复：主菜单 7 → 5 → 输入本份备份的编号 → 1"
         echo "# 手动：dsh plugin --profile $profile add <名称>@<版本>"
         echo "manifest=dsh-manager-plugin-manifest v1"
         echo "profile=$profile"
@@ -2647,7 +2647,7 @@ plugin_menu_loop() {
             echo
             echo "操作："
             echo "1. 安装插件"
-            echo "5. 插件清单（查看 / 导出 / 恢复）"
+            echo "5. 备份插件列表"
             echo "0. 返回"
             echo
             read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -2719,7 +2719,7 @@ plugin_menu_loop() {
             echo "2. 启用插件"
             echo "3. 禁用插件"
             echo "4. 删除插件（支持批量）"
-            echo "5. 插件清单（查看 / 导出 / 恢复）"
+            echo "5. 备份插件列表"
             echo "0. 返回"
             echo
             read -r -p "请选择操作： " choice || { echo; return 0; }
@@ -3452,103 +3452,23 @@ status_and_logs() {
 # ========== 插件清单（菜单 7 → 5） ==========
 # 从备份与恢复搬过来：插件的东西归插件菜单，
 # 而且 1KB 的元数据混进大归档列表会被"保留最近N个"顺手删掉。
-# 选一个清单；只有一个就直接用，省一次选择
-plugin_manifest_pick() {
-    local files=($(list_backups_plugins))
-    if [ ${#files[@]} -eq 0 ]; then
-        warn "还没有导出过插件清单" >&2
-        return 1
-    fi
-    if [ ${#files[@]} -eq 1 ]; then
-        printf '%s\n' "${files[0]}"
-        return 0
-    fi
+# ---------- 备份插件列表 ----------
+# 设计：列表即入口。打开就看得到有几份备份，输入编号直接看内容，
+# 不在"先选动作、再问是哪一份"上绕两遍。
+#   b = 备份当前列表（b 是 backup，避免和编号撞车）
+#   数字 = 查看该份备份
 
-    echo "请选择清单：" >&2
-    echo >&2
-    local i
-    for i in "${!files[@]}"; do
-        print_manifest_row "$((i+1))" "${files[$i]}" >&2
-    done
-    echo >&2
-    local c
-    read -r -p "编号（0 取消）： " c || return 1
-    if [ "$c" = "0" ] || [ -z "$c" ]; then
-        warn "操作已取消" >&2
-        return 1
-    fi
-    if ! [[ "$c" =~ ^[0-9]+$ ]] || [ "$c" -lt 1 ] || [ "$c" -gt ${#files[@]} ]; then
-        err "无效的选择" >&2
-        return 1
-    fi
-    printf '%s\n' "${files[$((c-1))]}"
-}
-
-# 清单的主要用途：看清楚"当时装了什么、什么版本"，
-# 换机器或重装后照着装。是否真去重装由用户判断——DSH 版本不同时插件未必兼容。
-plugin_manifest_view() {
-    title "清单内容"
-
-    local file
-    file=$(plugin_manifest_pick) || return 1
-
-    local profile created saved_dsh cur_dsh
-    profile=$(grep -m1 '^profile=' "$file" 2>/dev/null | cut -d= -f2)
-    created=$(grep -m1 '^created=' "$file" 2>/dev/null | cut -d= -f2)
-    saved_dsh=$(grep -m1 '^dsh_version=' "$file" 2>/dev/null | cut -d= -f2)
-    cur_dsh=$(get_dsh_version 2>/dev/null)
-
-    echo "文件：$(basename "$file")"
-    echo "生成：${created:-未知}"
-    echo "profile：${profile:-未知}"
-    echo "当时 DSH：${saved_dsh:-未知}"
-    echo "当前 DSH：${cur_dsh:-未知}"
-    if [ -n "$saved_dsh" ] && [ -n "$cur_dsh" ] && [ "$saved_dsh" != "$cur_dsh" ]; then
-        warn "DSH 版本已经变了，下面这些插件未必兼容当前版本"
-    fi
-    echo
-
-    local n=0 entry name d
-    echo "插件（按依赖声明顺序）："
-    while IFS= read -r entry; do
-        [ -n "$entry" ] || continue
-        n=$((n + 1))
-        name="${entry%@*}"
-        printf '  %2d. %s\n' "$n" "$entry"
-        d=$(grep -m1 "^declared=${name} " "$file" 2>/dev/null | sed 's/^declared=[^ ]* //')
-        [ -n "$d" ] && printf '      声明兼容 %s\n' "$d"
-    done < <(grep '^plugin=' "$file" 2>/dev/null | sed 's/^plugin=//')
-    echo "  共 $n 个"
-    echo
-
-    local nb=0 b
-    echo "bundle 装载顺序："
-    while IFS= read -r b; do
-        [ -n "$b" ] || continue
-        nb=$((nb + 1))
-        printf '  %2d. %s\n' "$nb" "$b"
-    done < <(grep '^bundle=' "$file" 2>/dev/null | sed 's/^bundle=//')
-    echo "  共 $nb 个"
-    echo
-
-    local patch patch_real
-    patch=$(sed -n '/^patch_begin$/,/^patch_end$/p' "$file" 2>/dev/null | sed '1d;$d')
-    # 只剩注释、空行和 [] 的，就是 DSH 生成的默认模板，不算"有内容"
-    patch_real=$(printf '%s\n' "$patch" | grep -v '^[[:space:]]*#' \
-        | grep -v '^[[:space:]]*$' | grep -v '^\[\]$')
-    if [ -n "$patch_real" ]; then
-        echo "补丁层 cordis.patch.yml：有自定义内容"
-        printf '%s\n' "$patch" | sed 's/^/  /'
-    else
-        echo "补丁层 cordis.patch.yml：空（默认模板）"
-    fi
-    echo
-    echo "手动安装："
-    echo "  dsh plugin --profile ${profile:-web} add <名称>@<版本>"
+# 一行一份：编号、时间、里面几个插件
+print_manifest_line() {
+    local idx="$1" file="$2"
+    local filedate n
+    filedate=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
+    n=$(grep -c '^plugin=' "$file" 2>/dev/null)
+    printf '  %2s. %s   %s 个插件\n' "$idx" "${filedate:-未知时间}" "${n:-0}"
 }
 
 plugin_manifest_export() {
-    title "导出插件清单"
+    title "备份当前插件列表"
     if ! init_backup_dir; then
         return 1
     fi
@@ -3557,115 +3477,151 @@ plugin_manifest_export() {
         rm -f "$out"
         return 1
     fi
-    info "已导出"
+    info "已备份"
     echo "文件：$(basename "$out")"
-    echo "大小：$(du -h "$out" | cut -f1)"
     echo "插件：$(grep -c '^plugin=' "$out" 2>/dev/null) 个"
     echo "位置：$BACKUP_DIR"
 }
 
-plugin_manifest_restore_pick() {
-    local files=($(list_backups_plugins))
-    if [ ${#files[@]} -eq 0 ]; then
-        warn "还没有导出过插件清单"
-        echo "先用本菜单的「1. 导出当前插件清单」生成一份。"
-        return 1
-    fi
-
-    echo "可恢复的清单："
-    echo
-    local i
-    for i in "${!files[@]}"; do
-        print_manifest_row "$((i+1))" "${files[$i]}"
-    done
-    echo
-    read -r -p "请输入编号（或 0 取消）： " choice || { echo; return 0; }
-
-    if [ "$choice" = "0" ] || [ -z "$choice" ]; then
-        warn "操作已取消"
-        return 0
-    fi
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#files[@]} ]; then
-        err "无效的选择"
-        return 1
-    fi
-
-    restore_plugin_manifest "${files[$((choice-1))]}"
-}
-
-plugin_manifest_delete() {
-    local files=($(list_backups_plugins))
-    if [ ${#files[@]} -eq 0 ]; then
-        warn "还没有导出过插件清单"
-        return 1
-    fi
-
-    echo "现有清单："
-    echo
-    local i
-    for i in "${!files[@]}"; do
-        print_manifest_row "$((i+1))" "${files[$i]}"
-    done
-    echo
-    read -r -p "要删除的编号（多个用空格分隔，q 取消）： " input || { echo; return 0; }
-    if [ "$input" = "q" ] || [ -z "$input" ]; then
-        warn "操作已取消"
-        return 0
-    fi
-
-    local n cnt=0
-    for n in $input; do
-        if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#files[@]} ]; then
-            rm -f "${files[$((n-1))]}" && cnt=$((cnt + 1))
-        else
-            warn "忽略无效序号：$n"
-        fi
-    done
-    info "已删除 $cnt 个清单"
-}
-
-plugin_manifest_menu() {
+# 单份备份的详情页：看内容 + 对这份备份做操作
+plugin_manifest_detail() {
+    local file="$1"
     while true; do
         clear 2>/dev/null
-        title "插件清单"
+        title "备份详情"
 
-        local files=($(list_backups_plugins))
-        if [ ${#files[@]} -eq 0 ]; then
-            echo "还没有导出过插件清单。"
-            echo "导出的是「装了什么、什么版本」，约 1KB，不含插件代码——"
-            echo "换机器或重装后照着它把插件装回来即可。"
+        local created saved_dsh cur_dsh profile
+        created=$(grep -m1 '^created=' "$file" 2>/dev/null | cut -d= -f2)
+        saved_dsh=$(grep -m1 '^dsh_version=' "$file" 2>/dev/null | cut -d= -f2)
+        profile=$(grep -m1 '^profile=' "$file" 2>/dev/null | cut -d= -f2)
+        cur_dsh=$(get_dsh_version 2>/dev/null)
+
+        local n
+        n=$(grep -c '^plugin=' "$file" 2>/dev/null)
+        printf '备份时间：%s\n' "${created:-未知}"
+        printf '插件数量：%s 个\n' "${n:-0}"
+        printf '备份时 DSH：%s\n' "${saved_dsh:-未知}"
+        if [ -n "$saved_dsh" ] && [ -n "$cur_dsh" ] && [ "$saved_dsh" != "$cur_dsh" ]; then
+            printf '当前 DSH：%s   ' "$cur_dsh"
+            printf "${YEL}版本已变，下面这些插件未必兼容${RST}\n"
         else
-            echo "已有 ${#files[@]} 个清单："
-            echo
-            local i
-            for i in "${!files[@]}"; do
-                print_manifest_row "$((i+1))" "${files[$i]}"
-            done
-            echo
-            echo "清单记录的是「当时装了哪些插件、什么版本」，"
-            echo "换机器或重装后照着装即可。"
+            printf '当前 DSH：%s\n' "${cur_dsh:-未知}"
         fi
         echo
-        echo "1. 查看清单内容"
-        echo "2. 导出当前插件清单"
-        echo "3. 从清单恢复插件（DSH 版本不同时可能不兼容）"
-        echo "4. 删除清单"
+
+        # 主体就是插件列表：名称@版本，有兼容声明的跟在后面
+        local entry name d
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            name="${entry%@*}"
+            printf '  %s\n' "$entry"
+            d=$(grep -m1 "^declared=${name} " "$file" 2>/dev/null | sed 's/^declared=[^ ]* //')
+            [ -n "$d" ] && printf '      声明兼容 %s\n' "$d"
+        done < <(grep '^plugin=' "$file" 2>/dev/null | sed 's/^plugin=//')
+
+        echo
+        printf '文件：%s\n' "$(basename "$file")"
+        printf "${DIM}（原文另含装载顺序与补丁层，供手动重建时查）${RST}\n"
+        echo
+        echo "1. 按这份备份重装插件"
+        echo "2. 删除这份备份"
         echo "0. 返回"
         echo
+        local choice
         read -r -p "请选择： " choice || { echo; return 0; }
 
         case $choice in
-            1) plugin_manifest_view ;;
-            2) plugin_manifest_export ;;
-            3) plugin_manifest_restore_pick ;;
-            4) plugin_manifest_delete ;;
-            0) return 0 ;;
-            *) warn "无效选项"; continue ;;
+            1)
+                restore_plugin_manifest "$file" || true
+                ;;
+            2)
+                echo
+                read -r -p "确认删除 $(basename "$file")？(y/N): " CONFIRM || CONFIRM=""
+                if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+                    rm -f "$file" && info "已删除" || err "删除失败"
+                    echo
+                    printf "按回车继续..."
+                    read -r null || { echo; return 0; }
+                    return 0
+                fi
+                warn "操作已取消"
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选项"
+                continue
+                ;;
         esac
 
         echo
         printf "按回车继续..."
         read -r null || { echo; return 0; }
+    done
+}
+
+plugin_manifest_menu() {
+    while true; do
+        clear 2>/dev/null
+        title "备份插件列表"
+
+        printf '当前 DSH：%s\n' "$(get_dsh_version 2>/dev/null)"
+        echo
+
+        local files=($(list_backups_plugins))
+        if [ ${#files[@]} -eq 0 ]; then
+            echo "还没有备份过插件列表。"
+            echo "备份的是「当时装了哪些插件、什么版本」，约 1KB，不含插件代码。"
+            echo "换机器或重装后照着它把插件装回来即可。"
+            echo
+            echo "b. 备份当前插件列表"
+            echo "0. 返回"
+            echo
+            read -r -p "请选择： " choice || { echo; return 0; }
+            case $choice in
+                b|B) plugin_manifest_export ;;
+                0) return 0 ;;
+                *) warn "无效选项"; continue ;;
+            esac
+            echo
+            printf "按回车继续..."
+            read -r null || { echo; return 0; }
+            continue
+        fi
+
+        printf '共 %s 份备份（输入编号查看）：\n\n' "${#files[@]}"
+        local i
+        for i in "${!files[@]}"; do
+            print_manifest_line "$((i+1))" "${files[$i]}"
+        done
+        echo
+        echo "b. 备份当前插件列表"
+        echo "0. 返回"
+        echo
+        read -r -p "请选择： " choice || { echo; return 0; }
+
+        case $choice in
+            b|B)
+                plugin_manifest_export
+                echo
+                printf "按回车继续..."
+                read -r null || { echo; return 0; }
+                ;;
+            ''|*[!0-9]*)
+                warn "无效选项"
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                if [ "$choice" -ge 1 ] && [ "$choice" -le ${#files[@]} ]; then
+                    plugin_manifest_detail "${files[$((choice-1))]}"
+                else
+                    warn "无效编号"
+                fi
+                ;;
+        esac
     done
 }
 
