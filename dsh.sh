@@ -20,10 +20,12 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.0"
+SCRIPT_VERSION="1.19.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
+# 快捷命令兜底软链目录（与安装器的 DSH_LINK_DIR 保持一致）
+LINK_DIR="${DSH_LINK_DIR:-/usr/bin}"
 # 仓库 raw 基地址（拼 install.sh 等其它文件时用）
 RAW_BASE="${DSH_RAW_BASE:-https://raw.githubusercontent.com/ZDX1717/dsh-manager/main}"
 SCRIPT_RAW_URL="$RAW_BASE/dsh.sh"
@@ -971,8 +973,8 @@ update_self() {
         return 1
     fi
     
-    # 若存在 /usr/bin 下的软链，保持指向不变
-    local LINK="/usr/bin/$(basename "$SELF")"
+    # 若存在兜底软链，保持指向不变
+    local LINK="$LINK_DIR/$(basename "$SELF")"
     if [ -L "$LINK" ]; then
         ln -sf "$SELF" "$LINK" 2>/dev/null
     fi
@@ -1457,7 +1459,7 @@ uninstall_self() {
     
     echo "将删除以下内容："
     echo "  · 管理脚本本体：$SELF"
-    [ -L "/usr/bin/$TARGET_NAME" ] && echo "  · 软链接：/usr/bin/$TARGET_NAME"
+    [ -L "$LINK_DIR/$TARGET_NAME" ] && echo "  · 软链接：$LINK_DIR/$TARGET_NAME"
     [ -f "$PROFILE_FILE" ] && echo "  · 快捷命令：$PROFILE_FILE"
     echo "  · ~/.bashrc 中的 alias d=..."
     echo
@@ -1479,12 +1481,12 @@ uninstall_self() {
     fi
     
     # 软链与 profile 片段
-    if [ -L "/usr/bin/$TARGET_NAME" ]; then
-        if $rm_sh "/usr/bin/$TARGET_NAME" 2>/dev/null; then
-            echo "已删除 /usr/bin/$TARGET_NAME"
+    if [ -L "$LINK_DIR/$TARGET_NAME" ]; then
+        if $rm_sh "$LINK_DIR/$TARGET_NAME" 2>/dev/null; then
+            echo "已删除 $LINK_DIR/$TARGET_NAME"
         else
-            warn "删除失败（权限不足？）：/usr/bin/$TARGET_NAME"
-            echo "  可手动执行：$rm_sh /usr/bin/$TARGET_NAME"
+            warn "删除失败（权限不足？）：$LINK_DIR/$TARGET_NAME"
+            echo "  可手动执行：$rm_sh $LINK_DIR/$TARGET_NAME"
         fi
     fi
     [ -f "$PROFILE_FILE" ] && { $rm_sh "$PROFILE_FILE" 2>/dev/null; echo "已删除 $PROFILE_FILE"; }
@@ -2909,9 +2911,9 @@ restore_sessions() {
         echo "已恢复备份：$filename"
         echo
         echo "建议操作："
-        echo "1. 重启 DSH 服务：systemctl restart dsh-web"
+        echo "1. 重启 DSH 服务：systemctl restart $SVC"
         echo "2. 检查会话是否正常加载"
-        echo "3. 如有问题，检查日志：journalctl -u dsh-web -f"
+        echo "3. 如有问题，检查日志：journalctl -u $SVC -f"
         echo
         # 换机器恢复时，工作区记的绝对路径多半不存在 —— 顺手补出来
         recreate_workspace_dirs
