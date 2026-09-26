@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.14.1"
+SCRIPT_VERSION="1.15.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1788,6 +1788,83 @@ ensure_pnpm() {
     err "pnpm 安装失败"
     echo "可手动执行：npm install -g pnpm"
     return 1
+}
+
+# ---------- 内存与进程诊断 ----------
+# spawn ENOMEM 是内核拒绝创建进程，不是"装不下包"。
+# 最常见成因：可用内存少 + 没有 swap，而服务进程虚拟大小又很大，
+# fork pnpm 时复制页表失败。这里把那几个决定性的数字一次列出来。
+kb2h() {
+    awk -v k="${1:-0}" 'BEGIN{
+        if (k >= 1048576) printf "%.1fG", k / 1048576;
+        else if (k >= 1024) printf "%.0fM", k / 1024;
+        else printf "%dK", k
+    }'
+}
+
+mem_diag() {
+    title "内存与进程诊断"
+    echo "用于判断插件安装报 spawn ENOMEM 的原因"
+    echo
+
+    local mem_total mem_avail swap_total swap_free
+    mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    [ -z "$mem_avail" ] && mem_avail=$(awk '/^MemFree:/{print $2}' /proc/meminfo 2>/dev/null)
+    swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    swap_free=$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null)
+    mem_total=${mem_total:-0}; mem_avail=${mem_avail:-0}
+    swap_total=${swap_total:-0}; swap_free=${swap_free:-0}
+
+    printf '内存     总 %s   可用 %s\n' "$(kb2h "$mem_total")" "$(kb2h "$mem_avail")"
+    if [ "$swap_total" -eq 0 ]; then
+        printf 'Swap     %s\n' "${RED}没有 swap${RST}"
+    else
+        printf 'Swap     总 %s   已用 %s\n' "$(kb2h "$swap_total")" "$(kb2h $((swap_total - swap_free)))"
+    fi
+    printf '映射上限 vm.max_map_count = %s\n' "$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 未知)"
+    printf '内存策略 vm.overcommit_memory = %s\n' "$(cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo 未知)"
+    printf '进程上限 ulimit -u = %s\n' "$(ulimit -u 2>/dev/null || echo 未知)"
+    echo
+
+    local PID VSZ RSS
+    PID=$(sysctl show -p MainPID --value "$SVC" 2>/dev/null | tr -d ' ')
+    if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/status" ]; then
+        VSZ=$(awk '/^VmSize:/{print $2}' "/proc/$PID/status" 2>/dev/null)
+        RSS=$(awk '/^VmRSS:/{print $2}' "/proc/$PID/status" 2>/dev/null)
+        printf '服务进程 PID %s\n' "$PID"
+        printf '         常驻内存 %s   虚拟 %s\n' "$(kb2h "${RSS:-0}")" "$(kb2h "${VSZ:-0}")"
+    else
+        printf '服务进程 未运行或读不到进程信息\n'
+    fi
+
+    local oom
+    oom=$(dmesg 2>/dev/null | grep -ci 'out of memory\|oom-kill')
+    oom=${oom:-0}
+    [ "$oom" -gt 0 ] && printf '内核日志 发现 %s 条 OOM 记录\n' "$oom"
+    echo
+
+    if [ "$swap_total" -eq 0 ] && [ "$mem_avail" -lt 524288 ]; then
+        warn "结论：可用内存偏低且完全没有 swap —— 服务进程内 fork pnpm 极易 ENOMEM"
+        echo "      加 swap 后重试："
+        echo "        fallocate -l 2G /swapfile && chmod 600 /swapfile"
+        echo "        mkswap /swapfile && swapon /swapfile"
+    elif [ "$swap_total" -eq 0 ]; then
+        warn "结论：完全没有 swap，内存吃紧时没有任何缓冲"
+        echo "      建议加 1~2GB swap 兜底："
+        echo "        fallocate -l 2G /swapfile && chmod 600 /swapfile"
+        echo "        mkswap /swapfile && swapon /swapfile"
+    elif [ "$oom" -gt 0 ]; then
+        warn "结论：近期出现过 OOM，内存确实不够用"
+        echo "      可加 swap 或升配；也可改在终端里装插件（避开服务进程内 fork）"
+    else
+        info "结论：内存与 swap 看起来够用"
+        echo "      若仍报 ENOMEM，多半卡在映射数或进程数上限："
+        echo "        sysctl -w vm.max_map_count=262144"
+    fi
+    echo
+    echo "绕开服务进程的办法（在终端里执行）："
+    echo "  dsh plugin --profile $(get_current_profile) add <包名>@<版本>"
 }
 
 # 生成不覆盖已有文件的备份名：同一秒里连续改两次也不会互相盖掉
@@ -3908,6 +3985,7 @@ maintenance_menu() {
         echo "3. 安装 Node.js 与 npm"
         echo "4. 扫描修复会话文件"
         echo "5. 补齐工作区目录"
+        echo "6. 内存与进程诊断"
         echo "0. 返回"
         echo
         local choice
@@ -3919,6 +3997,7 @@ maintenance_menu() {
             3) install_nodejs_npm ;;
             4) scan_and_fix_sessions ;;
             5) recreate_workspace_dirs ;;
+            6) mem_diag ;;
             0) return 0 ;;
             *) warn "无效选项"; continue ;;
         esac

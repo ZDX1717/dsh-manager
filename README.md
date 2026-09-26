@@ -73,7 +73,7 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.14.1 ====
+==== DSH-Web 管理面板 v1.15.0 ====
 
 DSH   0.1.5-rc.2
 服务  dsh-web  运行中
@@ -134,6 +134,22 @@ DSH   0.1.5-rc.2
 而且每个插件都用 `dsh.compatibility` / `peerDependencies` 声明了它支持的 DSH 版本范围，
 把旧插件代码整包恢复到新 DSH 上，正是"插件忽然跑不起来"的主因
 （典型表现是启动时报 `cannot resolve profile bundle`）。
+
+## 装插件报 `spawn ENOMEM`（主菜单 9 → 6）
+
+`ENOMEM` 是内核拒绝创建进程，不是"包装不下"。市场的更新是在 **DSH 服务进程内部**
+fork 出 pnpm 的，而服务进程虚拟大小通常十几 GB，fork 时复制页表需要内存；
+机器空闲内存少、又没有 swap 时，就会失败。
+
+`主菜单 9 → 6 内存与进程诊断` 会一次列出决定性的几个数字（内存/swap、
+`vm.max_map_count`、`overcommit_memory`、`ulimit -u`、服务进程的常驻与虚拟大小、
+内核 OOM 记录），并给出结论与对应命令。
+
+应急办法是**绕开服务进程**，在终端里装：
+
+```bash
+dsh plugin --profile web add <包名>@<版本>
+```
 
 ## 插件管理里"启用"到底指什么（主菜单 7）
 
