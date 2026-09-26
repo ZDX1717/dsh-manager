@@ -17,6 +17,13 @@
 #           所以上面第 1 种写法不需要手动加 sudo。
 # ============================================================
 
+# 与 dsh.sh 一致：明确拒绝 dash/sh，给出可执行的正确用法
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "❌ 本安装器必须使用 bash 运行，不要用 sh/dash" >&2
+    echo "执行方式：bash $0" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 # ---------- 配置 ----------
@@ -50,7 +57,23 @@ CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 # dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
 # 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
 # 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
-PAYLOAD_SHA256="0ed1657838041a7df1a9dd1dd95cfaf238a0afb415cadf17fc7abc5c76e4f368"
+PAYLOAD_SHA256="6f0006129982c7fa1d73f88e015bf3636e1364b7c4d8df9cd39c8651e4acfba0"
+# 写进 profile 片段的标记行：用于判断"这文件是不是本脚本写的"，
+# 避免把 /etc/passwd 这类无关文件截断成两行 alias
+PROFILE_MARK="# DSH 管理脚本快捷命令"
+
+# 内置哈希必须是 64 位十六进制：空值会让校验静默放行（fail-open），
+# 而界面上仍然打印"校验通过"，运维无从察觉
+case "$PAYLOAD_SHA256" in
+    *[!0-9a-f]*|"")
+        echo "❌ 内置 PAYLOAD_SHA256 非法（必须是 64 位十六进制）" >&2
+        exit 1
+        ;;
+esac
+[ "${#PAYLOAD_SHA256}" -eq 64 ] || {
+    echo "❌ 内置 PAYLOAD_SHA256 长度不对（应为 64）" >&2
+    exit 1
+}
 
 ASSUME_YES=0
 SKIP_VERIFY=0
@@ -66,10 +89,16 @@ PAYLOAD_TMP=""
 # 可用 DSH_EXTRA_MIRRORS 追加自定义镜像（空格分隔的 URL 前缀）。
 resolve_commit_sha() {
     local owner="$1" repo="$2" ref="$3"
+    # GITHUB_API 来自环境变量：只接受 http(s)，否则以 "-" 开头的值会被 curl
+    # 当成选项（例如 -K<文件> 可注入 url+output，以 root 往任意路径写）
+    case "$GITHUB_API" in
+        http://*|https://*) ;;
+        *) return 0 ;;
+    esac
     curl -fsSL \
         --connect-timeout "$CURL_CONNECT_TIMEOUT" \
         --max-time "$CURL_MAX_TIME" \
-        "$GITHUB_API/repos/$owner/$repo/commits/$ref" 2>/dev/null \
+        -- "$GITHUB_API/repos/$owner/$repo/commits/$ref" 2>/dev/null \
         | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
         | head -n 1
 }
@@ -119,7 +148,7 @@ download_urls() {
 verify_payload() {
     local file="$1"
     [ "$SKIP_VERIFY" -eq 1 ] && return 0
-    [ -n "$PAYLOAD_SHA256" ] || return 0
+    [ -n "$PAYLOAD_SHA256" ] || return 1
     local actual
     actual="$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)"
     [ -n "$actual" ] || return 1
@@ -134,11 +163,19 @@ download_file() {
     local url
     while IFS= read -r url; do
         [ -n "$url" ] || continue
+        # 源串来自 DSH_RAW_BASE / DSH_EXTRA_MIRRORS（环境变量），必须只当 URL 用：
+        # 不加 -- 的话，"-K/tmp/cfg" 之类会被 curl 解析成选项，可注入
+        # url + output，实现以 root 往任意路径写内容。
+        case "$url" in
+            http://*|https://*) ;;
+            *) printf '    ⚠ 跳过非 http(s) 源：%s\n' "$url"; continue ;;
+        esac
         printf '  尝试 %s\n' "$url"
+        # 注意顺序：-o 必须在 -- 之前，-- 之后的一切都会被当作 URL
         if curl -fsSL \
                 --connect-timeout "$CURL_CONNECT_TIMEOUT" \
                 --max-time "$CURL_MAX_TIME" \
-                "$url" -o "$dest" 2>/dev/null && [ -s "$dest" ]; then
+                -o "$dest" -- "$url" 2>/dev/null && [ -s "$dest" ]; then
             if [ "$need_verify" -eq 1 ] && ! verify_payload "$dest"; then
                 printf '    ⚠ 内容与预期哈希不符，拒绝使用该源\n'
                 continue
@@ -148,6 +185,49 @@ download_file() {
         printf '    失败或超时，换下一个源\n'
     done < <(download_urls "$rel")
     return 1
+}
+
+# 计算 git blob 哈希：sha1("blob <字节数>\0" + 内容)
+# 用于和 GitHub contents API 登记的 sha 比对
+git_blob_sha() {
+    local f="$1" size
+    command -v sha1sum >/dev/null 2>&1 || return 1
+    size=$(stat -c%s "$f" 2>/dev/null) || return 1
+    { printf 'blob %s\0' "$size"; cat -- "$f"; } | sha1sum | cut -d' ' -f1
+}
+
+# 校验"提权时重新下载的那份安装器"与仓库登记是否一致。
+# 为什么需要：payload（dsh.sh）有内置 SHA-256 门禁，但**安装器自身**没有；
+# 而它马上要以 root 运行。第一次抓取（用户自己的 curl）与提权时的第二次抓取
+# 是两个独立请求，中间人可以对后者投毒。
+# 返回 0=一致  1=不一致（可能被投毒）  2=无法比对（API 不可达 / 缺工具）
+verify_installer_self() {
+    local file="$1"
+    case "$RAW_BASE" in
+        *raw.githubusercontent.com/*) ;;
+        *) return 2 ;;
+    esac
+    case "$GITHUB_API" in
+        http://*|https://*) ;;
+        *) return 2 ;;
+    esac
+
+    local rest owner repo ref
+    rest="${RAW_BASE#*raw.githubusercontent.com/}"
+    owner="${rest%%/*}"; rest="${rest#*/}"
+    repo="${rest%%/*}";  ref="${rest#*/}"
+
+    local api_sha local_sha
+    api_sha="$(curl -fsSL \
+        --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+        --max-time "$CURL_MAX_TIME" \
+        -- "$GITHUB_API/repos/$owner/$repo/contents/$SELF_NAME?ref=$ref" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+        | head -n 1)"
+    [ -n "$api_sha" ] || return 2
+    local_sha="$(git_blob_sha "$file")" || return 2
+    [ -n "$local_sha" ] || return 2
+    [ "$api_sha" = "$local_sha" ]
 }
 
 # ---------- 颜色 ----------
@@ -201,8 +281,18 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -y|--yes)        ASSUME_YES=1 ;;
-            --from-file)     shift; FROM_FILE="${1:-}" ;;
+            --from-file)
+                # 缺参数时必须报错：静默当成"没给"，会把用户明确要求的
+                # 离线安装悄悄变成"从互联网下载并安装"
+                if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+                    err "--from-file 后面必须跟一个文件路径"
+                    exit 2
+                fi
+                FROM_FILE="$2"
+                shift
+                ;;
             --skip-verify)   SKIP_VERIFY=1 ;;
+            --)              shift; break ;;
             -h|--help)       usage; exit 0 ;;
             *)               warn "忽略未知参数：$1" ;;
         esac
@@ -223,10 +313,15 @@ confirm() {
     if [ -t 0 ]; then
         read -r -p "$prompt" answer || answer=""
     elif { true; } 2>/dev/null < /dev/tty; then
-        read -r -p "$prompt" answer < /dev/tty
+        # 这里同样要兜住 read 失败（EOF / Ctrl+D）：本行不在条件上下文里，
+        # set -e 会让脚本在问句之后凭空退出、连"已取消"都不打印
+        read -r -p "$prompt" answer < /dev/tty || answer=""
     else
-        warn "当前无可用终端，默认继续（如需中止请按 Ctrl+C）"
-        answer="y"
+        # 没有控制终端：默认值必须是"否"。
+        # 无人值守（cron/CI/curl|bash < /dev/null）时默认继续，
+        # 等于绕过确认还顺带提权，与 (y/N) 的语义相反。
+        warn "当前无可用终端，已按默认拒绝（需要自动安装请显式加 -y）"
+        return 1
     fi
     [[ "$answer" =~ ^[Yy]$ ]]
 }
@@ -252,7 +347,15 @@ ensure_root() {
 
     # 以文件方式调用时直接复制自身，省一次下载；
     # 进程替换 / 管道调用时 $0 不是普通文件，改为重新下载。
-    if [ -f "$0" ] && cp -- "$0" "$tmp" 2>/dev/null; then
+    #
+    # 只接受"带路径分隔符的 $0"：`curl | bash` 时 $0 是字面量 "bash"，
+    # 仅凭当前目录里存在同名普通文件就当成"我自己"，
+    # 会把那个文件 cp 过来、过一遍 bash -n，然后以 root 执行。
+    local self_is_file=0
+    case "$0" in
+        */*) [ -f "$0" ] && self_is_file=1 ;;
+    esac
+    if [ "$self_is_file" -eq 1 ] && cp -- "$0" "$tmp" 2>/dev/null; then
         :
     else
         # 只有走"重新下载自身"这条路才依赖 curl，缺了要直接说清楚，
@@ -283,6 +386,39 @@ ensure_root() {
         err "取到的安装脚本语法校验未通过，已中止（可能下载不完整）"
         exit 1
     fi
+
+    # 只有"重新下载"这条路才需要额外校验（本地副本来自用户自己给的文件，
+    # 与首次运行的是同一份，不存在两次抓取之间被投毒的问题）
+    if [ "$self_is_file" -ne 1 ]; then
+        local vr=0
+        verify_installer_self "$tmp" || vr=$?
+        case "$vr" in
+            0)
+                echo "安装脚本校验通过（与仓库登记一致）"
+                ;;
+            1)
+                err "重新下载的安装脚本与仓库登记不一致，已中止"
+                echo "  这可能是中间人投毒或镜像被换过内容。"
+                echo "  更稳妥的做法：先把安装器下载到本地，再执行"
+                echo "    curl -sSL $SELF_URL -o /tmp/install.sh && bash /tmp/install.sh"
+                rm -f -- "$tmp"
+                exit 1
+                ;;
+            2)
+                warn "无法比对重新下载的安装脚本（GitHub API 不可达或缺少 sha1sum）"
+                echo "  这份脚本马上就要以 root 运行，却没有任何完整性依据。"
+                echo "  建议取消，改为先下载到本地再执行："
+                echo "    curl -sSL $SELF_URL -o /tmp/install.sh && bash /tmp/install.sh"
+                if [ "${DSH_TRUST_UNVERIFIED:-0}" = "1" ]; then
+                    warn "已按 DSH_TRUST_UNVERIFIED=1 继续"
+                elif ! confirm "仍要继续？(y/N): "; then
+                    warn "已取消"
+                    rm -f -- "$tmp"
+                    exit 1
+                fi
+                ;;
+        esac
+    fi
     chmod +x "$tmp"
 
     # 选项与环境变量都必须显式传给 root 子进程：
@@ -297,6 +433,7 @@ ensure_root() {
     # 用 sudo env 显式带入变量（-E 在多数发行版被 sudoers 禁用，不可靠）
     sudo env \
         DSH_RAW_BASE="$RAW_BASE" \
+        DSH_GITHUB_API="$GITHUB_API" \
         DSH_EXTRA_MIRRORS="${DSH_EXTRA_MIRRORS:-}" \
         DSH_INSTALL_DIR="$INSTALL_DIR" \
         DSH_PROFILE_FILE="$PROFILE_FILE" \
@@ -311,6 +448,17 @@ ensure_root() {
 
 # ---------- 依赖 ----------
 check_deps() {
+    PKG_INSTALL_CMD="$(detect_pkg_install_cmd)"
+    # 离线安装只用 cp，根本不需要 curl —— 以前无条件强制 curl，
+    # 把最需要离线安装的内网机器（无 curl、无外网）卡死在第一步
+    [ -n "$FROM_FILE" ] && return 0
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        err "缺少 sha256sum，无法校验下载内容（coreutils/busybox 通常自带）"
+        echo "  装上它，或明确承担风险：bash $SELF_NAME --skip-verify"
+        exit 1
+    fi
+
     if ! command -v curl >/dev/null 2>&1; then
         warn "未找到 curl，尝试安装..."
         local installed=0
@@ -323,6 +471,10 @@ check_deps() {
             if yum install -y curl; then installed=1; fi
         elif command -v apk >/dev/null 2>&1; then
             if apk add --no-cache curl; then installed=1; fi
+        elif command -v zypper >/dev/null 2>&1; then
+            if zypper --non-interactive install curl; then installed=1; fi
+        elif command -v pacman >/dev/null 2>&1; then
+            if pacman -Sy --noconfirm curl; then installed=1; fi
         else
             err "未找到可用的包管理器，请手动安装 curl 后重试"
             exit 1
@@ -335,22 +487,39 @@ check_deps() {
         info "curl 安装完成"
     fi
 
-    # jq / rsync / zstd 都是可选，缺了也能装，只提示不强制安装
+    # rsync / zstd 是可选的，缺了也能装，只提示不强制安装。
+    # 注意：管理脚本解析 package.json 用的是 node（DSH 的硬依赖），
+    # 早已不依赖 jq / python3，这里不再提它们。
     local missing=""
     local t
-    for t in jq rsync zstd; do
+    for t in rsync zstd; do
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
     done
     if [ -n "$missing" ]; then
         missing="${missing# }"
         warn "可选依赖未安装：$missing"
         echo "  缺失影响："
-        echo "    jq       删除插件时必须（要同步修改 package.json 的 bundles）"
-        echo "             没有 jq 时若有 python3 也能用，两者都缺则无法删插件"
-        echo "    rsync    备份/恢复用更稳的复制方式"
-        echo "    zstd     会话文件完整性校验"
-        echo "  安装示例：apt install -y $missing"
+        echo "    rsync    备份/恢复用更稳的复制方式（缺了会退回 tar 管道）"
+        echo "    zstd     会话文件完整性校验（缺了会跳过深度校验）"
+        echo "  安装示例：$PKG_INSTALL_CMD $missing"
     fi
+
+    # 被装出来的 dsh.sh 硬依赖 systemd，在没有 systemd 的系统上
+    # 会"装成功然后完全不可用"，这里提前说清楚
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "本机没有 systemctl：管理脚本只支持 systemd，装好后大部分功能不可用"
+    fi
+}
+
+# 按检测到的包管理器生成安装示例（以前固定写 apt，非 Debian 上照抄即失败）
+detect_pkg_install_cmd() {
+    if command -v apt-get >/dev/null 2>&1; then echo "apt-get install -y"
+    elif command -v dnf >/dev/null 2>&1;  then echo "dnf install -y"
+    elif command -v yum >/dev/null 2>&1;  then echo "yum install -y"
+    elif command -v zypper >/dev/null 2>&1; then echo "zypper install -y"
+    elif command -v pacman >/dev/null 2>&1; then echo "pacman -S --noconfirm"
+    elif command -v apk >/dev/null 2>&1;  then echo "apk add --no-cache"
+    else echo "（请用你的包管理器安装）"; fi
 }
 
 # ---------- 下载主脚本 ----------
@@ -413,6 +582,38 @@ fetch_payload() {
     info "校验通过，大小 $(wc -c < "$dest" | tr -d ' ') 字节"
 }
 
+# 校验"root 要写入的目录"是否安全：绝对路径 + root 属主 + 组/其他不可写。
+# 为什么：DSH_INSTALL_DIR / DSH_PROFILE_FILE 来自环境变量并被转发进 root 上下文，
+# 不校验的话，把安装目录指到普通用户可写的地方，用户替换掉二进制后，
+# 管理员下次 `sudo dsh-manager` 就等于执行了用户的代码。
+safe_root_dir() {
+    local d="$1" label="$2" mode g o
+    case "$d" in
+        /*) ;;
+        *) err "$label 必须是绝对路径：$d"; return 1 ;;
+    esac
+    if [ ! -d "$d" ]; then
+        err "$label 不存在：$d"
+        return 1
+    fi
+    if [ "$(stat -c %u "$d" 2>/dev/null)" != "0" ]; then
+        err "$label 不是 root 属主：$d"
+        return 1
+    fi
+    mode="$(stat -c %a "$d" 2>/dev/null)"
+    if [ -n "$mode" ]; then
+        # 只看后两位（组 / 其他），忽略 setuid/sticky 前缀
+        g="${mode: -2:1}"; o="${mode: -1}"
+        case "$g$o" in
+            *[2367]*)
+                err "$label 允许组或其他用户写入：$d（root 往里写的东西会被替换）"
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
 # ---------- 安装 ----------
 install_payload() {
     local src="$1"
@@ -425,6 +626,9 @@ install_payload() {
             return 1
         fi
     fi
+    if ! safe_root_dir "$INSTALL_DIR" "安装目录（DSH_INSTALL_DIR）"; then
+        return 1
+    fi
 
     if ! install -m 0755 "$src" "$TARGET_BIN" 2>/dev/null; then
         err "无法写入 $TARGET_BIN"
@@ -435,7 +639,20 @@ install_payload() {
 
     # /usr/local/bin 通常在 PATH 里；补一个 /usr/bin 软链兜底
     if [ -d /usr/bin ]; then
-        ln -sf "$TARGET_BIN" "/usr/bin/$TARGET_NAME" 2>/dev/null || true
+        if ln -sf "$TARGET_BIN" "/usr/bin/$TARGET_NAME" 2>/dev/null; then
+            :
+        else
+            warn "无法创建软链 /usr/bin/$TARGET_NAME（不影响使用 $TARGET_BIN）"
+        fi
+    fi
+
+    # 回读校验：以前收尾的失败被 || true 吞掉，会"看起来装成功"
+    if [ ! -x "$TARGET_BIN" ]; then
+        err "回读校验失败：$TARGET_BIN 不存在或不可执行"
+        return 1
+    fi
+    if ! command -v "$TARGET_NAME" >/dev/null 2>&1; then
+        warn "$TARGET_BIN 不在当前 PATH 中，请直接用完整路径调用"
     fi
 }
 
@@ -456,26 +673,51 @@ alias_state() {
 setup_alias() {
     title "配置快捷命令"
 
-    if [ -w "$(dirname "$PROFILE_FILE")" ] || [ ! -e "$PROFILE_FILE" ]; then
-        cat > "$PROFILE_FILE" <<EOF
-# DSH 管理脚本快捷命令
+    local pdir
+    pdir="$(dirname "$PROFILE_FILE")"
+
+    if [ ! -d "$pdir" ]; then
+        warn "目录不存在，跳过系统级快捷命令：$pdir"
+    elif ! safe_root_dir "$pdir" "profile 片段目录（DSH_PROFILE_FILE 所在目录）"; then
+        warn "该目录不安全，跳过系统级快捷命令"
+    elif [ -e "$PROFILE_FILE" ] && ! head -n 1 "$PROFILE_FILE" 2>/dev/null | grep -qF "$PROFILE_MARK"; then
+        # 不是本脚本写的文件一律不动：以前是无条件 cat > 覆盖，
+        # 把 DSH_PROFILE_FILE 指向 /etc/passwd 这类文件就会被截断成两行 alias
+        warn "$PROFILE_FILE 已存在且不是本脚本写的，已跳过（不覆盖）"
+        echo "  如需改用本脚本，请先自行备份并删除该文件"
+    else
+        # 写失败不该让整个安装以失败告终（二进制此时已经装好了）
+        if cat > "$PROFILE_FILE" <<EOF
+$PROFILE_MARK
 alias $ALIAS_NAME='$TARGET_NAME'
 EOF
-        chmod 0644 "$PROFILE_FILE" 2>/dev/null || true
-        info "已写入 $PROFILE_FILE（系统级，登录 shell 生效）"
-    else
-        warn "无法写入 $PROFILE_FILE，跳过"
+        then
+            chmod 0644 "$PROFILE_FILE" 2>/dev/null || true
+            info "已写入 $PROFILE_FILE（系统级，登录 shell 生效）"
+        else
+            warn "写入失败，跳过系统级快捷命令：$PROFILE_FILE"
+        fi
     fi
 
     # 再写到调用者的 ~/.bashrc，覆盖"非登录交互 shell"的情况
     local login_user="${SUDO_USER:-$(id -un)}"
-    [ "$login_user" = "root" ] && login_user="${SUDO_USER:-root}"
 
-    local home
+    local home=""
+    # getent 不是 busybox applet：缺失时退回直接读 /etc/passwd，
+    # 否则在纯 busybox 系统上会静默跳过用户级别名。
     # 末尾的 || true 必不可少：getent 对不存在的用户返回 2，
     # 而本函数是在非条件上下文中调用的，set -e 会因此静默终止整个安装
-    home="$(getent passwd "$login_user" 2>/dev/null | cut -d: -f6 || true)"
-    if [ -z "$home" ] || [ ! -f "$home/.bashrc" ]; then
+    if command -v getent >/dev/null 2>&1; then
+        home="$(getent passwd "$login_user" 2>/dev/null | cut -d: -f6 || true)"
+    fi
+    if [ -z "$home" ] && [ -r /etc/passwd ]; then
+        home="$(awk -F: -v u="$login_user" '$1==u{print $6; exit}' /etc/passwd 2>/dev/null || true)"
+    fi
+    if [ -z "$home" ]; then
+        warn "无法确定用户 $login_user 的家目录，已跳过用户级快捷命令"
+        return 0
+    fi
+    if [ ! -f "$home/.bashrc" ]; then
         return 0
     fi
 
@@ -498,12 +740,16 @@ EOF
             ;;
     esac
 
-    {
+    if {
         echo ""
-        echo "# DSH 管理脚本快捷命令"
+        echo "$PROFILE_MARK"
         echo "alias $ALIAS_NAME='$TARGET_NAME'"
-    } >> "$rc"
-    info "已写入 $rc（用户：$login_user）"
+    } >> "$rc" 2>/dev/null; then
+        info "已写入 $rc（用户：$login_user）"
+    else
+        # 二进制已经装好了，这里失败不该让整个安装报错退出
+        warn "写入失败，跳过用户级快捷命令：$rc"
+    fi
 }
 
 # ---------- 结束信息 ----------
@@ -515,14 +761,15 @@ done_info() {
     echo "  $TARGET_NAME"
     echo "  $TARGET_BIN"
     echo
-    echo "首次使用建议先执行菜单里的「初次初始化 Systemd 服务」。"
+    echo "首次使用：运行 $TARGET_NAME，然后按 1「快速开始」——"
+    echo "它会自动初始化 systemd 服务、启动，并给出访问链接。"
     echo
     echo "更新："
     echo "  bash <(curl -sSL $SELF_URL) -y   # 重跑本安装器即可覆盖升级"
     echo
-    echo "卸载："
-    echo "  sudo rm -f $TARGET_BIN /usr/bin/$TARGET_NAME $PROFILE_FILE"
-    echo "  sed -i \"/alias $ALIAS_NAME='$TARGET_NAME'/d\" ~/.bashrc"
+    echo "卸载（也可用管理面板的「卸载」菜单）："
+    echo "  rm -f $TARGET_BIN /usr/bin/$TARGET_NAME $PROFILE_FILE"
+    echo "  再手动删除 ~/.bashrc 里那行：alias $ALIAS_NAME='$TARGET_NAME'"
 }
 
 # ---------- 主流程 ----------
@@ -535,14 +782,16 @@ main() {
     echo
 
     # 先提权，后续步骤全部以 root 身份执行
-    ensure_root
-
-    check_deps
-
     if ! confirm "确认安装？(y/N): "; then
         warn "安装已取消"
         exit 0
     fi
+
+    # 提权与依赖安装放在确认之后：以前 check_deps 会先以 root 装包，
+    # 用户回答 n 时系统其实已经被改动过了
+    ensure_root
+
+    check_deps
 
     if ! PAYLOAD_TMP="$(mktemp "${TMPDIR:-/tmp}/dsh-payload.XXXXXX" 2>/dev/null)"; then
         err "无法创建临时文件（检查 TMPDIR 是否可写）：${TMPDIR:-/tmp}"

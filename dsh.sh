@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.15.2"
+SCRIPT_VERSION="1.16.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -186,9 +186,15 @@ detect_pkg_mgr() {
 # ========== 下载到文件（curl 优先，wget 兜底） ==========
 fetch_to_file() {
     local url="$1" out="$2"
+    # URL 可能来自环境变量（DSH_EXTRA_MIRRORS 等），不加 -- 的话
+    # "-K<文件>" 之类会被 curl 解析成选项，可注入 url+output
+    case "$url" in
+        http://*|https://*) ;;
+        *) return 1 ;;
+    esac
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
-            --max-time 60 "$url" -o "$out"
+            --max-time "$SCRIPT_MAX_TIME" -o "$out" -- "$url"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -T 60 -O "$out" "$url"
     else
@@ -592,10 +598,14 @@ get_self_path() {
 # 所以优先用 commit SHA 寻址，保证拿到最新内容。
 resolve_commit_sha() {
     local owner="$1" repo="$2" ref="$3"
+    case "$GITHUB_API" in
+        http://*|https://*) ;;
+        *) return 0 ;;
+    esac
     curl -fsSL \
         --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
         --max-time "$SCRIPT_MAX_TIME" \
-        "$GITHUB_API/repos/$owner/$repo/commits/$ref" 2>/dev/null \
+        -- "$GITHUB_API/repos/$owner/$repo/commits/$ref" 2>/dev/null \
         | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
         | head -n 1
 }
@@ -616,10 +626,17 @@ git_blob_sha() {
 verify_via_api() {
     local file="$1" owner="$2" repo="$3" path="$4" ref="$5"
     local api_sha local_sha
+    # 必须用同一个 GITHUB_API：写死 api.github.com 的话，用户为绕过网络屏蔽
+    # 配了镜像后，sha 解析走镜像成功、比对却打不通 → 被上层当成"API 不可达"
+    # 而放行未校验内容，恰好在需要防篡改的场景关掉防篡改。
+    case "$GITHUB_API" in
+        http://*|https://*) ;;
+        *) return 2 ;;
+    esac
     api_sha="$(curl -fsSL \
         --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
         --max-time "$SCRIPT_MAX_TIME" \
-        "https://api.github.com/repos/$owner/$repo/contents/$path?ref=$ref" 2>/dev/null \
+        -- "$GITHUB_API/repos/$owner/$repo/contents/$path?ref=$ref" 2>/dev/null \
         | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
         | head -n 1)"
     [ -n "$api_sha" ] || return 2
@@ -690,12 +707,19 @@ download_self_update() {
     local tried=0 mismatch=0
     while IFS= read -r url; do
         [ -n "$url" ] || continue
+        # 源串来自 DSH_SCRIPT_URL / DSH_EXTRA_MIRRORS，只接受 http(s)：
+        # 否则以 "-" 开头的值会被 curl 当成选项
+        case "$url" in
+            http://*|https://*) ;;
+            *) echo "    跳过非 http(s) 源：$url"; continue ;;
+        esac
         tried=$((tried + 1))
         echo "  尝试：$url"
+        # -o 必须在 -- 之前，-- 之后的一切都被当作 URL
         if ! curl -fsSL \
                 --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
                 --max-time "$SCRIPT_MAX_TIME" \
-                "$url" -o "$dest" 2>/dev/null || [ ! -s "$dest" ]; then
+                -o "$dest" -- "$url" 2>/dev/null || [ ! -s "$dest" ]; then
             echo "    下载失败或超时，换下一个源"
             continue
         fi
