@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.10.0"
+SCRIPT_VERSION="1.11.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1478,6 +1478,70 @@ backup_kind() {
     esac
 }
 
+# ---------- 工作区目录补齐 ----------
+# DSH 把工作区按【绝对路径】记录在 storages/workspace.json 里。
+# 换机器/重装后这些路径通常不存在：DSH 不会删记录，只会把工作区标成
+# missing-dir（记录里的会话归属照旧，靠路径字符串比对）。
+# 所以建出同名空目录就能让工作区重新可用 —— 对话正文本来就已恢复在 sessions/。
+list_missing_workspaces() {
+    local ws="$HOME/.dsh/storages/workspace.json"
+    [ -f "$ws" ] || return 0
+    command -v node >/dev/null 2>&1 || return 0
+    node -e '
+      const fs = require("fs");
+      let d;
+      try { d = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(0); }
+      const t = (d.tables || {}).workspaces || {};
+      const seen = new Set();
+      for (const w of Object.values(t)) {
+        const p = w && w.path;
+        if (!p || seen.has(p)) continue;
+        seen.add(p);
+        let ok = false;
+        try { ok = fs.statSync(p).isDirectory(); } catch (e) { ok = false; }
+        if (!ok) console.log(p + "\t" + (w.title || ""));
+      }
+    ' "$ws" 2>/dev/null
+}
+
+recreate_workspace_dirs() {
+    local missing
+    missing=$(list_missing_workspaces)
+    if [ -z "$missing" ]; then
+        info "工作区目录都在"
+        return 0
+    fi
+
+    warn "以下工作区目录在当前机器上不存在："
+    local p t
+    while IFS=$'\t' read -r p t; do
+        [ -n "$p" ] || continue
+        printf '  %s\n' "$p"
+    done <<< "$missing"
+    echo
+    echo "DSH 不会删这些工作区的记录，只是把它们标成不可用；"
+    echo "对话已经恢复在 sessions/ 里，建出同名目录即可让工作区重新可用。"
+    echo "（只是空目录，原来目录里的文件不在备份范围内）"
+    echo
+    read -r -p "现在创建这些目录？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "已跳过"
+        return 0
+    fi
+
+    local n=0
+    while IFS=$'\t' read -r p t; do
+        [ -n "$p" ] || continue
+        if mkdir -p "$p" 2>/dev/null; then
+            info "已创建 $p"
+            n=$((n + 1))
+        else
+            err "创建失败（权限不足？）：$p"
+        fi
+    done <<< "$missing"
+    info "共创建 $n 个目录"
+}
+
 # ---------- 备份分组 ----------
 # 类型顺序：完整(最有价值) -> 仅对话 -> 旧版对话+插件 -> 插件清单
 backup_group_name() {
@@ -2150,6 +2214,9 @@ restore_sessions() {
         echo "1. 重启 DSH 服务：systemctl restart dsh-web"
         echo "2. 检查会话是否正常加载"
         echo "3. 如有问题，检查日志：journalctl -u dsh-web -f"
+        echo
+        # 换机器恢复时，工作区记的绝对路径多半不存在 —— 顺手补出来
+        recreate_workspace_dirs
     else
         printf " 失败\n"
         err "恢复失败"
@@ -3622,6 +3689,7 @@ maintenance_menu() {
         echo "2. 快捷命令 .bashrc（添加 / 移除）"
         echo "3. 安装 Node.js 与 npm"
         echo "4. 扫描修复会话文件"
+        echo "5. 补齐工作区目录"
         echo "0. 返回"
         echo
         local choice
@@ -3632,6 +3700,7 @@ maintenance_menu() {
             2) alias_menu ;;
             3) install_nodejs_npm ;;
             4) scan_and_fix_sessions ;;
+            5) recreate_workspace_dirs ;;
             0) return 0 ;;
             *) warn "无效选项"; continue ;;
         esac
