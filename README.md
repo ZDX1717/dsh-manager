@@ -73,7 +73,7 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.11.0 ====
+==== DSH-Web 管理面板 v1.12.0 ====
 
 DSH   0.1.5-rc.2
 服务  dsh-web  运行中
@@ -178,7 +178,10 @@ b. 备份当前插件列表
 - **主要用途是查看**：换机器或重装后照着这份列表装。DSH 版本不同时插件未必兼容，
   所以恢复是详情页里的一次显式选择（`1`），不是默认动作；版本不一致时页面会直接告警。
 - 重装按**精确版本**（`dsh plugin --profile web add 名称@版本`），需要联网
-  （registry 见 `~/.npmrc`）。
+  （registry 见 `~/.npmrc`）。**需要 pnpm**：`dsh plugin` 只是把参数转发给 pnpm，
+  Node 自带的 npm 不含它。脚本会在动手前检查，缺了就问你要不要装
+  （先试 `corepack enable pnpm`，不行再 `npm install -g pnpm`），
+  不会让你对着七个"安装失败"发懵。
 - 备份文件里另含装载顺序与 `cordis.patch.yml` 原文，供手动重建时查。
 
 放在插件菜单而不是备份菜单的原因：这份列表只有 1 KB，

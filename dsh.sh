@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.11.0"
+SCRIPT_VERSION="1.12.0"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1478,6 +1478,13 @@ backup_kind() {
     esac
 }
 
+# 清单里补丁层的"实际内容"：只剩注释、空行和 [] 的就是 DSH 默认模板，视为空。
+# 恢复时若拿模板去覆盖目标机，会把用户自己写的补丁层冲掉，所以必须区分。
+manifest_patch_real() {
+    sed -n '/^patch_begin$/,/^patch_end$/p' "$1" 2>/dev/null | sed '1d;$d' \
+        | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' | grep -v '^\[\]$'
+}
+
 # ---------- 工作区目录补齐 ----------
 # DSH 把工作区按【绝对路径】记录在 storages/workspace.json 里。
 # 换机器/重装后这些路径通常不存在：DSH 不会删记录，只会把工作区标成
@@ -1731,6 +1738,58 @@ dsh_cmd() {
     fi
 }
 
+# ---------- pnpm 前置检查 ----------
+# `dsh plugin ...` 只是把参数转发给 pnpm。pnpm 不在 PATH 时，一批插件会
+# 全部失败，而且 dsh 只回一句 "pnpm not found on PATH"，很容易被误读成
+# "插件下架了"。所以动手前先查、先装。
+ensure_pnpm() {
+    if command -v pnpm >/dev/null 2>&1; then
+        return 0
+    fi
+
+    err "没有找到 pnpm —— DSH 的 dsh plugin 靠它安装插件"
+    echo "DSH 用 pnpm 管理 profile 插件；Node 自带的 npm 默认不含 pnpm。"
+    echo
+
+    if ! command -v npm >/dev/null 2>&1 && ! command -v corepack >/dev/null 2>&1; then
+        echo "npm 和 corepack 都没有，请先安装 Node.js（见 主菜单 9 → 3）。"
+        return 1
+    fi
+
+    read -r -p "现在安装 pnpm？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo
+        echo "手动安装（任选其一）："
+        echo "  corepack enable pnpm"
+        echo "  npm install -g pnpm"
+        return 1
+    fi
+
+    echo
+    local ret=1
+    if command -v corepack >/dev/null 2>&1; then
+        echo "正在用 corepack 启用 pnpm..."
+        if corepack enable pnpm 2>&1; then
+            ret=0
+        fi
+    fi
+    if [ $ret -ne 0 ] && command -v npm >/dev/null 2>&1; then
+        echo "正在用 npm 安装 pnpm..."
+        if npm install -g pnpm 2>&1; then
+            ret=0
+        fi
+    fi
+
+    hash -r 2>/dev/null || true
+    if [ $ret -eq 0 ] && command -v pnpm >/dev/null 2>&1; then
+        info "pnpm 已就绪：$(pnpm --version 2>/dev/null)"
+        return 0
+    fi
+    err "pnpm 安装失败"
+    echo "可手动执行：npm install -g pnpm"
+    return 1
+}
+
 # 读 profile 的插件与 bundle 清单，输出 "plugin=名字@版本" / "declared=..." / "bundle=..."
 # 用 node 解析 JSON —— DSH 本身就依赖 node，等于零额外依赖，
 # 比自己用 sed 抠 package.json 稳得多。
@@ -1864,6 +1923,12 @@ restore_plugin_manifest() {
     echo "安装方式：dsh plugin --profile $profile add <名称>@<版本>"
     echo "需要联网（registry 见 ~/.npmrc）"
     echo
+
+    # 先确认 pnpm 就位，否则下面会一路失败
+    if ! ensure_pnpm; then
+        warn "没有 pnpm，装不了插件，已中止"
+        return 1
+    fi
     read -r -p "确认开始安装？(y/N): " CONFIRM || CONFIRM=""
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         warn "操作已取消"
@@ -1872,31 +1937,34 @@ restore_plugin_manifest() {
 
     local DSH_BIN_REAL
     DSH_BIN_REAL=$(dsh_cmd)
-    local okn=0 badn=0
+    local okn=0 badn=0 out
     for i in "${!names[@]}"; do
         echo
         echo "--- [$((i+1))/${#names[@]}] ${names[$i]}@${vers[$i]}"
-        if "$DSH_BIN_REAL" plugin --profile "$profile" add "${names[$i]}@${vers[$i]}"; then
+        if out=$("$DSH_BIN_REAL" plugin --profile "$profile" add "${names[$i]}@${vers[$i]}" 2>&1); then
             okn=$((okn + 1))
         else
             badn=$((badn + 1))
-            warn "安装失败：${names[$i]}@${vers[$i]}（可能已下架或版本不存在）"
+            printf '%s\n' "$out" | grep -v '^$' | tail -n2 | sed 's/^/      /'
+            warn "安装失败：${names[$i]}@${vers[$i]}"
         fi
     done
 
     echo
     info "完成：成功 $okn 个，失败 $badn 个"
 
-    # 恢复用户补丁层（仅当备份里非空）
+    # 恢复用户补丁层：只有"真内容"才问。
+    # 全是注释和 [] 的是 DSH 默认模板，拿它覆盖会把目标机上的补丁冲掉。
     local pdir="$HOME/.dsh/profiles/$profile"
-    local patch
-    patch=$(sed -n '/^patch_begin$/,/^patch_end$/p' "$file" 2>/dev/null | sed '1d;$d')
-    if [ -n "$patch" ]; then
+    if [ -n "$(manifest_patch_real "$file")" ]; then
+        local patch
+        patch=$(sed -n '/^patch_begin$/,/^patch_end$/p' "$file" 2>/dev/null | sed '1d;$d')
         echo
-        echo "清单里带有 cordis.patch.yml 内容："
+        echo "清单里带有你写的 cordis.patch.yml 补丁："
         printf '%s\n' "$patch" | sed 's/^/  /'
         echo
-        read -r -p "写回 $pdir/cordis.patch.yml？(y/N): " CONFIRM || CONFIRM=""
+        echo "注意：会覆盖 $pdir/cordis.patch.yml 当前内容"
+        read -r -p "写回补丁层？(y/N): " CONFIRM || CONFIRM=""
         if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
             printf '%s\n' "$patch" > "$pdir/cordis.patch.yml" \
                 && info "已写回 cordis.patch.yml" \
@@ -2729,6 +2797,10 @@ plugin_menu_loop() {
                     fi
                     
                     echo "正在安装..."
+                    if ! ensure_pnpm; then
+                        warn "没有 pnpm，装不了插件"
+                        continue
+                    fi
                     dsh plugin --profile "$profile" add "$PLUGIN_NAME"
                     if [ $? -eq 0 ]; then
                         info "安装成功：$PLUGIN_NAME"
@@ -2801,6 +2873,10 @@ plugin_menu_loop() {
                     fi
                     
                     echo "正在安装..."
+                    if ! ensure_pnpm; then
+                        warn "没有 pnpm，装不了插件"
+                        continue
+                    fi
                     dsh plugin --profile "$profile" add "$PLUGIN_NAME"
                     if [ $? -eq 0 ]; then
                         info "安装成功：$PLUGIN_NAME"
@@ -3576,7 +3652,11 @@ plugin_manifest_detail() {
 
         echo
         printf '文件：%s\n' "$(basename "$file")"
-        printf "${DIM}（原文另含装载顺序与补丁层，供手动重建时查）${RST}\n"
+        if [ -n "$(manifest_patch_real "$file")" ]; then
+            printf "补丁层：${YEL}有自定义 cordis.patch.yml${RST}\n"
+        else
+            printf '补丁层：无（原文另含装载顺序，供手动重建时查）\n'
+        fi
         echo
         echo "1. 按这份备份重装插件"
         echo "2. 删除这份备份"
