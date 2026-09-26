@@ -50,7 +50,7 @@ CURL_MAX_TIME="${DSH_MAX_TIME:-30}"
 # dsh.sh 的 SHA-256。每次改动 dsh.sh 必须同步更新这里。
 # 作用：下载源被第三方镜像篡改、或 CDN 返回了旧缓存时，
 # 都能立刻发现并拒绝安装，而不是把来路不明的内容装进系统。
-PAYLOAD_SHA256="6c8d0ec2eb7a389760fc67824a71c94bfaa2e032f4ccaf194224abca8c1993f9"
+PAYLOAD_SHA256="8bb25579a0fe6d6c74526060d995746a4ce13ed6e0e16799abc5608fb9868046"
 
 ASSUME_YES=0
 SKIP_VERIFY=0

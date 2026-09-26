@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.15.0"
+SCRIPT_VERSION="1.15.1"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -1863,7 +1863,11 @@ mem_diag() {
         echo "        sysctl -w vm.max_map_count=262144"
     fi
     echo
-    echo "绕开服务进程的办法（在终端里执行）："
+    echo "提示：服务跑久了常驻内存会上涨（上面那个数字）。"
+    echo "      市场更新插件是在服务进程里 fork pnpm，"
+    echo "      内存越紧越容易 ENOMEM；重启服务能立刻释放，"
+    echo "      实测往往重启后就能更新。"
+    echo "      也可绕开服务进程，在终端里装："
     echo "  dsh plugin --profile $(get_current_profile) add <包名>@<版本>"
 }
 
@@ -1984,10 +1988,13 @@ plugin_add_with_builds() {
         # 看上去像"插件坏了"，其实是机器内存不够
         if printf '%s\n' "$out" | grep -qi 'ENOMEM\|Cannot allocate memory'; then
             echo
-            warn "进程创建失败（ENOMEM）—— 多半是内存不足，不是插件的问题"
-            echo "      先看内存与 swap：free -h"
-            echo "      小内存机器加 1~2GB swap 后重试即可，例如："
-            echo "        fallocate -l 2G /swapfile && chmod 600 /swapfile"
+            warn "进程创建失败（ENOMEM）—— 是内存不够，不是插件的问题"
+            echo "      服务跑久了常驻内存会上涨，fork 子进程就更容易失败。"
+            echo "      最省事的办法：先重启服务释放内存，再重试"
+            echo "        systemctl restart $SVC"
+            echo "      仍不行再加 swap 兜底："
+            echo "        fallocate -l 2G /swapfile"
+            echo "        chmod 600 /swapfile"
             echo "        mkswap /swapfile && swapon /swapfile"
         fi
         return 1
