@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.15.1"
+SCRIPT_VERSION="1.15.2"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -664,19 +664,72 @@ script_update_urls() {
     done
 }
 
+# 校验候选脚本：0=与仓库登记一致  1=不一致  2=GitHub API 不可达（无法比对）
+verify_self_update() {
+    local file="$1"
+    case "$SCRIPT_RAW_URL" in
+        *raw.githubusercontent.com/*/*/*/*)
+            local rest="${SCRIPT_RAW_URL#*raw.githubusercontent.com/}"
+            local owner="${rest%%/*}"; rest="${rest#*/}"
+            local repo="${rest%%/*}";  rest="${rest#*/}"
+            local ref="${rest%%/*}";   local f="${rest#*/}"
+            verify_via_api "$file" "$owner" "$repo" "$f" "$ref"
+            return $?
+            ;;
+    esac
+    return 2
+}
+
+# 逐源下载"并逐个校验"，只有与仓库登记一致的才采用。
+# 关键点：raw.githubusercontent.com 有 5 分钟缓存，刚推完仓库时它会发旧内容；
+# 旧实现是"第一个下载成功的源就返回、之后才校验一次"，于是一撞上旧缓存
+# 就整体中止，明明后面那个 jsDelivr@<commit-sha> 是不可变且新鲜的。
+# 返回 0=采用成功  1=所有源都下不动  3=下到了但都与仓库登记不一致
 download_self_update() {
     local dest="$1" url
+    local tried=0 mismatch=0
     while IFS= read -r url; do
         [ -n "$url" ] || continue
+        tried=$((tried + 1))
         echo "  尝试：$url"
-        if curl -fsSL \
+        if ! curl -fsSL \
                 --connect-timeout "$SCRIPT_CONNECT_TIMEOUT" \
                 --max-time "$SCRIPT_MAX_TIME" \
-                "$url" -o "$dest" 2>/dev/null && [ -s "$dest" ]; then
-            return 0
+                "$url" -o "$dest" 2>/dev/null || [ ! -s "$dest" ]; then
+            echo "    下载失败或超时，换下一个源"
+            continue
         fi
-        echo "    失败或超时，换下一个源"
+        if ! head -n1 "$dest" | grep -q '^#!'; then
+            echo "    内容不是 Shell 脚本，换下一个源"
+            continue
+        fi
+        if ! bash -n "$dest" 2>/dev/null; then
+            echo "    语法校验未通过，换下一个源"
+            continue
+        fi
+
+        local vr=0
+        verify_self_update "$dest" || vr=$?
+        case "$vr" in
+            0)
+                echo "    校验通过（与仓库登记一致）"
+                return 0
+                ;;
+            2)
+                echo "    ${YEL}GitHub API 不可达，无法比对内容，先采用这个源${RST}"
+                return 0
+                ;;
+            1)
+                echo "    内容与仓库登记不一致（多半是 CDN 旧缓存），换下一个源"
+                mismatch=$((mismatch + 1))
+                ;;
+        esac
     done < <(script_update_urls)
+
+    if [ "$mismatch" -gt 0 ]; then
+        return 3
+    fi
+    [ "$tried" -gt 0 ] || return 1
     return 1
 }
 
@@ -719,10 +772,22 @@ update_self() {
         return 1
     }
     
-    if ! download_self_update "$TMP"; then
-        err "所有下载源均失败"
-        echo "可用 DSH_EXTRA_MIRRORS 指定镜像后重试，例如："
-        echo "  DSH_EXTRA_MIRRORS=https://ghproxy.net/https://raw.githubusercontent.com/ZDX1717/dsh-manager/main dsh-manager"
+    local dr=0
+    download_self_update "$TMP" || dr=$?
+    if [ "$dr" -ne 0 ]; then
+        case "$dr" in
+            3)
+                err "所有源下到的内容都与仓库登记不一致，已中止"
+                echo "  最常见的原因不是被篡改，而是 CDN 缓存滞后："
+                echo "  raw.githubusercontent.com 有 5 分钟缓存，刚更新完仓库时它会发旧内容。"
+                echo "  等 5 分钟后重试即可；仍然如此再怀疑镜像。"
+                ;;
+            *)
+                err "所有下载源均失败"
+                echo "可用 DSH_EXTRA_MIRRORS 指定镜像后重试，例如："
+                echo "  DSH_EXTRA_MIRRORS=https://ghproxy.net/https://raw.githubusercontent.com/ZDX1717/dsh-manager/main dsh-manager"
+                ;;
+        esac
         rm -f "$TMP"
         return 1
     fi
@@ -743,26 +808,6 @@ update_self() {
         rm -f "$TMP"
         return 1
     fi
-    
-    # 与仓库登记内容比对：能发现镜像篡改或 CDN 返回旧缓存
-    case "$SCRIPT_RAW_URL" in
-        *raw.githubusercontent.com/*/*/*/*)
-            local _rest="${SCRIPT_RAW_URL#*raw.githubusercontent.com/}"
-            local _owner="${_rest%%/*}"; _rest="${_rest#*/}"
-            local _repo="${_rest%%/*}";  _rest="${_rest#*/}"
-            local _ref="${_rest%%/*}";   local _file="${_rest#*/}"
-            local _vr=0
-            verify_via_api "$TMP" "$_owner" "$_repo" "$_file" "$_ref" || _vr=$?
-            case "$_vr" in
-                0) info "内容校验通过（与仓库登记一致）" ;;
-                1) err "下载内容与仓库登记不一致，可能是镜像篡改或旧缓存，已中止"
-                   echo "  如确认无误，可稍后重试或手动更新"
-                   rm -f "$TMP"
-                   return 1 ;;
-                2) warn "GitHub API 不可达，跳过内容比对（仅做了语法校验）" ;;
-            esac
-            ;;
-    esac
     
     local NEW_VER
     NEW_VER=$(grep -m1 '^SCRIPT_VERSION=' "$TMP" 2>/dev/null | cut -d'"' -f2)

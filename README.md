@@ -73,7 +73,7 @@ DSH_GITHUB_API=https://github.zdx1717.ccwu.cc/proxy/api.github.com \
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.15.1 ====
+==== DSH-Web 管理面板 v1.15.2 ====
 
 DSH   0.1.5-rc.2
 服务  dsh-web  运行中
