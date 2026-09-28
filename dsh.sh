@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.3"
+SCRIPT_VERSION="1.19.4"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -2475,8 +2475,47 @@ restore_plugin_manifest() {
     echo "声明过兼容范围的插件（仅供参考，不影响安装）："
     grep '^declared=' "$file" 2>/dev/null | sed 's/^declared=/  /' || true
     echo
-    echo "安装方式：dsh plugin --profile $profile add <名称>@<版本>"
     echo "需要联网（registry 见 ~/.npmrc）"
+    echo
+    echo "安装方式："
+    echo "1. 按清单里的精确版本"
+    echo "2. 各插件的最新版本"
+    echo "0. 取消"
+    echo
+
+    local mode
+    read -r -p "请选择： " mode || mode=""
+    local want_latest=0
+    case "$mode" in
+        1) want_latest=0 ;;
+        2) want_latest=1 ;;
+        0|"")
+            warn "操作已取消"
+            return 0
+            ;;
+        *)
+            warn "无效选项"
+            return 1
+            ;;
+    esac
+
+    # 装最新版时规格写成 name@latest，交给 registry 的 latest 标签解析；
+    # 其余用清单里记录的精确版本
+    local -a specs=()
+    for i in "${!names[@]}"; do
+        if [ "$want_latest" -eq 1 ]; then
+            specs+=("${names[$i]}@latest")
+        else
+            specs+=("${names[$i]}@${vers[$i]}")
+        fi
+    done
+
+    local joined="" spec
+    for spec in "${specs[@]}"; do
+        [ -n "$joined" ] && joined="$joined、"
+        joined="$joined$spec"
+    done
+    printf '将安装 %s\n' "$joined"
     echo
 
     # 先确认 pnpm 就位，否则下面会一路失败
@@ -2491,19 +2530,33 @@ restore_plugin_manifest() {
     fi
 
     local okn=0 badn=0
-    for i in "${!names[@]}"; do
+    for i in "${!specs[@]}"; do
         echo
-        echo "--- [$((i+1))/${#names[@]}] ${names[$i]}@${vers[$i]}"
-        if plugin_add_with_builds "$profile" "${names[$i]}@${vers[$i]}"; then
+        echo "--- [$((i+1))/${#specs[@]}] ${specs[$i]}"
+        if plugin_add_with_builds "$profile" "${specs[$i]}"; then
             okn=$((okn + 1))
         else
             badn=$((badn + 1))
-            warn "安装失败：${names[$i]}@${vers[$i]}"
+            warn "安装失败：${specs[$i]}"
         fi
     done
 
     echo
     info "完成：成功 $okn 个，失败 $badn 个"
+
+    # 装最新版时装上的具体版本只有 registry 知道，回头从 package.json 读出来
+    if [ "$want_latest" -eq 1 ] && [ "$okn" -gt 0 ]; then
+        echo
+        echo "实际装上的版本："
+        node -e '
+          const fs = require("fs");
+          const [file, ...want] = process.argv.slice(1);
+          try {
+            const deps = (JSON.parse(fs.readFileSync(file, "utf8")).dependencies) || {};
+            for (const n of want) if (deps[n]) console.log("  " + n + "@" + String(deps[n]).replace(/^[\^~]/, ""));
+          } catch (e) {}
+        ' "$HOME/.dsh/profiles/$profile/package.json" "${names[@]}" 2>/dev/null
+    fi
 
     # 恢复用户补丁层：只有"真内容"才问。
     # 全是注释和 [] 的是 DSH 默认模板，拿它覆盖会把目标机上的补丁冲掉。
