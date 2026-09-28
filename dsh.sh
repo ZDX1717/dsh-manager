@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.4"
+SCRIPT_VERSION="1.19.5"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -2014,6 +2014,39 @@ backup_status_lines() {
     local when
     when=$(stat -c %y "$newest" 2>/dev/null | cut -d' ' -f1,2 | cut -d: -f1,2)
     printf '%s  %s\n' "${when:-未知时间}" "$(backup_kind "$newest")"
+}
+
+# 兼容范围折行显示：统一 " || " 分隔，按行宽折行，续行与「（」对齐。
+# 只按 " || " 边界折，不切断单个版本号。
+print_compat() {
+    local indent="$1" ranges="$2" maxw="${3:-50}"
+    ranges=$(printf '%s' "$ranges" | sed 's/[[:space:]]*||[[:space:]]*/ || /g; s/^ *//; s/ *$//')
+    [ -n "$ranges" ] || return 0
+
+    local -a parts=()
+    local rest="$ranges" part
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            *" || "*) part="${rest%% || *}"; rest="${rest#* || }" ;;
+            *)        part="$rest"; rest="" ;;
+        esac
+        parts+=("$part")
+    done
+
+    local cont
+    cont=$(printf '%s%*s' "$indent" 10 '')   # 「声明兼容（」显示宽度 10 列   # 「声明兼容（」= 10 列，续行缩进对齐
+    local out="${indent}声明兼容（" width=0
+    for part in "${parts[@]}"; do
+        if [ "$width" -eq 0 ]; then
+            out="${out}${part}"; width=${#part}
+        elif [ $((width + 4 + ${#part})) -le "$maxw" ]; then
+            out="${out} || ${part}"; width=$((width + 4 + ${#part}))
+        else
+            out="${out}
+${cont}${part}"; width=${#part}
+        fi
+    done
+    printf '%s）\n' "$out"
 }
 
 # dsh 可执行文件：优先脚本配置的路径，其次 PATH
@@ -4438,7 +4471,7 @@ plugin_manifest_detail() {
             name="${entry%@*}"
             printf '  %s\n' "$entry"
             d=$(grep -m1 "^declared=${name} " "$file" 2>/dev/null | sed 's/^declared=[^ ]* //')
-            [ -n "$d" ] && printf '      声明兼容 %s\n' "$d"
+            [ -n "$d" ] && print_compat "      " "$d"
         done < <(grep '^plugin=' "$file" 2>/dev/null | sed 's/^plugin=//')
 
         echo
