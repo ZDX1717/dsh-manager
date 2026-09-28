@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.2"
+SCRIPT_VERSION="1.19.3"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -3342,6 +3342,38 @@ plugin_name_of() {
 # ========== 从 bundles 移除包 ==========
 # 删除插件必须同步修改 package.json 的 dsh.profile.bundles：
 # dependencies 移除了而 bundles 还留着，DSH 启动就报 cannot resolve profile bundle。
+# 批量启用/禁用：一次备份 + 一次原子写入。
+# 逐个调用 profile_bundles_edit 会产生一堆 .bak-* 并反复重写同一个文件。
+# 用法：profile_bundles_edit_many <profile> add|remove <名称...>
+profile_bundles_edit_many() {
+    local prof="$1" action="$2"; shift 2
+    [ "$#" -gt 0 ] || return 0
+    local pj
+    pj=$(profile_manifest "$prof")
+    [ -f "$pj" ] || { err "找不到 $pj"; return 1; }
+    if ! backup_file_unique "$pj" >/dev/null; then
+        err "无法备份 $pj，已中止（改坏了没法回退）"
+        return 1
+    fi
+    node -e '
+      const fs = require("fs");
+      const [file, action, ...names] = process.argv.slice(1);
+      const d = JSON.parse(fs.readFileSync(file, "utf8"));
+      d.dsh = d.dsh || {};
+      d.dsh.profile = d.dsh.profile || {};
+      let b = (d.dsh.profile.bundles = d.dsh.profile.bundles || []);
+      if (action === "add") {
+        for (const n of names) if (!b.includes(n)) b.push(n);
+      } else {
+        b = d.dsh.profile.bundles = b.filter((x) => !names.includes(x));
+      }
+      const tmp = file + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(d, null, 2) + "\n");
+      fs.renameSync(tmp, file);
+    ' "$pj" "$action" "$@" 2>/dev/null || { err "写入失败"; return 1; }
+    return 0
+}
+
 remove_from_bundles() {
     # 从当前目录的 package.json 里移除 bundles 条目。
     # 用 node 解析 —— DSH 离不开 node，等于零额外依赖；
@@ -3503,7 +3535,7 @@ plugin_menu_loop() {
             echo "1. 安装插件"
             echo "2. 启用插件"
             echo "3. 禁用插件"
-            echo "4. 删除插件（支持批量）"
+            echo "4. 删除插件"
             echo "5. 备份插件列表"
             echo "0. 返回"
             echo
@@ -3542,50 +3574,98 @@ plugin_menu_loop() {
                         err "安装失败"
                     fi
                     ;;
-                2)
-                    # 启用插件
-                    echo "请输入要启用的插件序号："
-                    read -r plugin_num
-                    if [[ "$plugin_num" =~ ^[0-9]+$ ]] && [ "$plugin_num" -ge 1 ] && [ "$plugin_num" -le ${#plugins[@]} ]; then
-                        local plugin_name="${plugins[$((plugin_num-1))]}"
-                        local plugin_short_name=$(plugin_name_of "$plugin_name")
-                        echo "启用插件：$plugin_short_name"
-                        
-                        if [ ! -d "node_modules/$plugin_short_name" ]; then
-                            err "插件没装（node_modules 里没有它），请先用 1 安装"
-                        elif profile_bundles_has "$profile" "$plugin_short_name"; then
-                            warn "插件已经是启用状态"
-                        elif profile_bundles_edit "$profile" "$plugin_short_name" add; then
-                            info "插件已启用：$plugin_short_name"
-                            echo "已加入 DSH 的加载列表（dsh.profile.bundles）"
-                            echo "提示：需要重启 DSH 服务才会生效"
-                        else
-                            err "启用失败"
-                        fi
+                2|3)
+                    # 启用 / 禁用插件，都支持批量
+                    local action action_cn
+                    if [ "$choice" = "2" ]; then action="add"; action_cn="启用"; else action="remove"; action_cn="禁用"; fi
+
+                    echo "请输入要${action_cn}的插件序号（多个用空格分隔，例如：1 3 5；a = 全部，0 = 取消）："
+                    read -r plugin_nums
+
+                    case "$plugin_nums" in
+                        ""|0)
+                            warn "操作已取消"
+                            continue
+                            ;;
+                    esac
+
+                    # 收齐目标：a = 全部"该动的"（启用=已安装未启用；禁用=已启用）
+                    local -a names=()
+                    local i pname
+                    if [ "$plugin_nums" = "a" ] || [ "$plugin_nums" = "A" ]; then
+                        for i in "${!plugins[@]}"; do
+                            pname=$(plugin_name_of "${plugins[$i]}")
+                            [ -n "$pname" ] || pname="${plugins[$i]}"
+                            [ -d "node_modules/$pname" ] || continue
+                            if [ "$action" = "add" ]; then
+                                profile_bundles_has "$profile" "$pname" || names+=("$pname")
+                            else
+                                profile_bundles_has "$profile" "$pname" && names+=("$pname")
+                            fi
+                        done
                     else
-                        err "无效的插件序号"
+                        local num
+                        for num in $plugin_nums; do
+                            if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt ${#plugins[@]} ]; then
+                                warn "忽略无效的序号：$num"
+                                continue
+                            fi
+                            pname=$(plugin_name_of "${plugins[$((num - 1))]}")
+                            [ -n "$pname" ] || pname="${plugins[$((num - 1))]}"
+                            names+=("$pname")
+                        done
                     fi
-                    ;;
-                3)
-                    # 禁用插件
-                    echo "请输入要禁用的插件序号："
-                    read -r plugin_num
-                    if [[ "$plugin_num" =~ ^[0-9]+$ ]] && [ "$plugin_num" -ge 1 ] && [ "$plugin_num" -le ${#plugins[@]} ]; then
-                        local plugin_name="${plugins[$((plugin_num-1))]}"
-                        local plugin_short_name=$(plugin_name_of "$plugin_name")
-                        echo "禁用插件：$plugin_short_name"
-                        
-                        if ! profile_bundles_has "$profile" "$plugin_short_name"; then
-                            warn "插件已经是禁用状态"
-                        elif profile_bundles_edit "$profile" "$plugin_short_name" remove; then
-                            info "插件已禁用：$plugin_short_name"
-                            echo "已从 DSH 的加载列表移除；包仍在 node_modules 里，随时可再启用"
-                            echo "提示：需要重启 DSH 服务才会生效"
+
+                    if [ ${#names[@]} -eq 0 ]; then
+                        warn "没有需要${action_cn}的插件"
+                        continue
+                    fi
+
+                    # 先分类：该跳过的（未安装 / 已经是目标状态）不与待办混在一起
+                    local -a todo=() skipped=()
+                    for pname in "${names[@]}"; do
+                        if [ ! -d "node_modules/$pname" ]; then
+                            skipped+=("$pname（未安装）")
+                        elif [ "$action" = "add" ] && profile_bundles_has "$profile" "$pname"; then
+                            skipped+=("$pname（已是启用状态）")
+                        elif [ "$action" = "remove" ] && ! profile_bundles_has "$profile" "$pname"; then
+                            skipped+=("$pname（本就未启用）")
                         else
-                            err "禁用失败"
+                            todo+=("$pname")
                         fi
+                    done
+
+                    if [ ${#skipped[@]} -gt 0 ]; then
+                        echo
+                        echo "跳过："
+                        for pname in "${skipped[@]}"; do printf '  %s\n' "$pname"; done
+                    fi
+                    if [ ${#todo[@]} -eq 0 ]; then
+                        warn "没有需要${action_cn}的插件"
+                        continue
+                    fi
+
+                    echo
+                    echo "将要${action_cn}："
+                    for pname in "${todo[@]}"; do printf '  %s\n' "$pname"; done
+                    local CONFIRM
+                    read -r -p "确认${action_cn}以上 ${#todo[@]} 个插件？(y/N): " CONFIRM || CONFIRM=""
+                    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+                        warn "操作已取消"
+                        continue
+                    fi
+
+                    if ! command -v node >/dev/null 2>&1; then
+                        err "缺少 node，无法安全修改 package.json"
+                        echo "  启用/禁用都要同步更新 dsh.profile.bundles"
+                        continue
+                    fi
+                    if profile_bundles_edit_many "$profile" "$action" "${todo[@]}"; then
+                        info "已${action_cn} ${#todo[@]} 个插件"
+                        echo "已更新 $profile 的 dsh.profile.bundles"
+                        echo "提示：需要重启 DSH 服务才会生效"
                     else
-                        err "无效的插件序号"
+                        err "${action_cn}失败"
                     fi
                     ;;
                 4)
