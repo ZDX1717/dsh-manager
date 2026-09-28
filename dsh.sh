@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.5"
+SCRIPT_VERSION="1.19.6"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -118,6 +118,66 @@ journal_cmd() {
         printf 'journalctl'
     else
         printf 'sudo journalctl'
+    fi
+}
+
+# ---------- 端口占用排查 ----------
+# 找出监听某端口的进程，输出 "PID<TAB>命令"。没有占用时返回 1。
+# ss/netstat 需要 root 才能看到别的用户的进程；fuser 是最后的兜底。
+port_holder() {
+    local port="${1:-$DSH_PORT}" line pid=""
+    if command -v ss >/dev/null 2>&1; then
+        line=$(ss -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1)
+        pid=$(printf '%s' "$line" | sed -n 's/.*pid=\([0-9]\+\).*/\1/p')
+    elif command -v netstat >/dev/null 2>&1; then
+        line=$(netstat -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1)
+        pid=$(printf '%s' "$line" | sed -n 's#.*[[:space:]]\([0-9]\+\)/[^[:space:]]*.*#\1#p')
+    elif command -v fuser >/dev/null 2>&1; then
+        pid=$(fuser "$port/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -n1)
+    fi
+    [ -n "$pid" ] || return 1
+    # 绝不碰 init 和自己
+    [ "$pid" = "1" ] && return 1
+    [ "$pid" = "$$" ] && return 1
+
+    local cmd=""
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/ *$//')
+    fi
+    [ -n "$cmd" ] || cmd=$(cat "/proc/$pid/comm" 2>/dev/null)
+    printf '%s\t%s\n' "$pid" "${cmd:-未知命令}"
+}
+
+# 单元停了但端口还被占着（多半是手工启动的残留进程）：问一次是否结束。
+# 结束策略：先 SIGTERM，5 秒内没释放才 SIGKILL，两轮都失败如实报错。
+handle_port_holder() {
+    local port="${1:-$DSH_PORT}" info pid cmd i
+    info=$(port_holder "$port") || return 0
+    pid="${info%%$'\t'*}"
+    cmd="${info#*$'\t'}"
+    echo
+    warn "端口 $port 仍被占用：PID $pid"
+    printf '      %s\n' "$cmd"
+    local CONFIRM
+    read -r -p "是否结束该进程？(y/N): " CONFIRM || CONFIRM=""
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        warn "已保留该进程（端口 $port 仍被占用）"
+        return 0
+    fi
+    kill "$pid" 2>/dev/null
+    for i in 1 2 3 4 5; do
+        sleep 1
+        if ! port_holder "$port" >/dev/null 2>&1; then
+            info "已结束 PID $pid，端口 $port 已释放"
+            return 0
+        fi
+    done
+    kill -9 "$pid" 2>/dev/null
+    sleep 1
+    if port_holder "$port" >/dev/null 2>&1; then
+        err "无法结束 PID $pid，请手动处理：kill -9 $pid"
+    else
+        info "已强制结束 PID $pid，端口 $port 已释放"
     fi
 }
 
@@ -1131,9 +1191,11 @@ stop_svc() {
     sleep 1
     if is_run; then
         err "停止失败，服务仍在运行"
-    else
-        info "服务已停止"
+        return 1
     fi
+    info "服务已停止"
+    # 单元停了，端口却可能还挂在别的进程上（比如手工 dsh web 起的）
+    handle_port_holder "$DSH_PORT"
 }
 
 # ========== 重启 ==========
@@ -4336,6 +4398,12 @@ status_and_logs() {
         if [ -n "$PORTLINE" ]; then
             LISTEN=1
             printf "监听    %s\n" "$(printf '%s' "$PORTLINE" | awk '{print $4}')"
+            if [ "$ACTIVE" != "active" ]; then
+                local _ph
+                if _ph=$(port_holder "$DSH_PORT"); then
+                    printf "占用    PID %s  %s\n" "${_ph%%$'\t'*}" "${_ph#*$'\t'}"
+                fi
+            fi
         elif [ -z "$PORTTOOL" ]; then
             # 没工具就老老实实说不知道，别把"测不出来"报成"没监听"
             printf "监听    未知（未安装 ss / netstat，无法检测端口）\n"
@@ -4347,6 +4415,9 @@ status_and_logs() {
         echo
         if [ "$HAS_UNIT" -eq 0 ]; then
             warn "结论：服务尚未初始化 —— 回主菜单按 1「快速开始」"
+        elif [ "$ACTIVE" != "active" ] && [ "$LISTEN" -eq 1 ] && port_holder "$DSH_PORT" >/dev/null 2>&1; then
+            err "结论：服务未运行，但端口 $DSH_PORT 被占用"
+            echo "      回主菜单按 3 停止，会问你是否结束该进程。"
         elif [ "$ACTIVE" != "active" ]; then
             err "结论：服务未运行 —— 主菜单按 2 可启动"
         elif [ "$LISTEN" -eq 1 ]; then
