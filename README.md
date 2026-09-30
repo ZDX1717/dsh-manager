@@ -44,9 +44,9 @@ bash <(curl -sSL https://cdn.jsdelivr.net/gh/ZDX1717/dsh-manager@main/install.sh
 ## 功能菜单
 
 ```
-==== DSH-Web 管理面板 v1.19.6 ====
+==== DSH-Web 管理面板 v1.19.7 ====
 ----------------------------------
-DSH   0.1.5-rc.3  [已安装]
+DSH   0.1.7-rc.2  [已安装]
 服务  dsh-web  [运行中]
 端口  3080  PID 12345
 ----------------------------------

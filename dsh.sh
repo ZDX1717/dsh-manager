@@ -20,7 +20,7 @@ DSH_BIN="$HOME/.local/bin/dsh"
 DSH_PORT="3080"
 
 # 本脚本自身版本与更新源（菜单 00 使用）
-SCRIPT_VERSION="1.19.6"
+SCRIPT_VERSION="1.19.7"
 TARGET_NAME="dsh-manager"
 # 安装器写入的系统级快捷命令片段（卸载时会清理）
 PROFILE_FILE="${DSH_PROFILE_FILE:-/etc/profile.d/dsh-manager.sh}"
@@ -3817,82 +3817,101 @@ plugin_menu_loop() {
                     fi
                     ;;
                 4)
-                    # 删除插件
-                    echo "请输入要删除的插件序号（多个序号用空格分隔，例如：1 3 5）："
+                    # 删除插件，支持批量与 a = 全部（已安装的）
+                    echo "请输入要删除的插件序号（多个用空格分隔，例如：1 3 5；a = 全部，0 = 取消）："
                     read -r plugin_nums
-                    
-                    if [ -z "$plugin_nums" ]; then
-                        err "未输入插件序号"
-                        continue
-                    fi
-                    
-                    echo "要删除的插件："
-                    local delete_list=()
-                    for num in $plugin_nums; do
-                        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le ${#plugins[@]} ]; then
-                            local plugin_name="${plugins[$((num-1))]}"
-                            local plugin_short_name=$(plugin_name_of "$plugin_name")
-                            if [ -z "$plugin_short_name" ]; then
-                                plugin_short_name="$plugin_name"
-                            fi
-                            delete_list+=("$plugin_short_name")
-                            echo "- $plugin_short_name"
-                        else
-                            warn "忽略无效的序号：$num"
-                        fi
-                    done
-                    
-                    if [ ${#delete_list[@]} -eq 0 ]; then
-                        err "没有有效的插件序号"
-                        continue
-                    fi
-                    
-                    echo
-                    echo "确认删除以上 ${#delete_list[@]} 个插件？(y/N): "
-                    read -r CONFIRM
-                    
-                    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-                        # 删除会同时改 dependencies 和 bundles，必须两者都成功：
-                        # bundles 改不掉、包却没了，DSH 下次启动就报
-                        # cannot resolve profile bundle。现在用 node 解析，
-                        # DSH 离不开 node，所以不再依赖 jq / python3。
-                        if ! command -v node >/dev/null 2>&1; then
-                            err "缺少 node，无法安全删除插件"
-                            echo "  删除插件必须同步更新 package.json 的 bundles。"
+
+                    case "$plugin_nums" in
+                        ""|0)
+                            warn "操作已取消"
                             continue
-                        fi
-                        
-                        local success_count=0
-                        local fail_count=0
-                        
-                        for plugin_short_name in "${delete_list[@]}"; do
-                            echo "删除插件：$plugin_short_name"
-                            if ! pnpm remove "$plugin_short_name" >/dev/null 2>&1; then
-                                warn "删除失败：$plugin_short_name"
-                                fail_count=$((fail_count + 1))
+                            ;;
+                    esac
+
+                    local -a delete_list=()
+                    local i pname num
+                    if [ "$plugin_nums" = "a" ] || [ "$plugin_nums" = "A" ]; then
+                        for i in "${!plugins[@]}"; do
+                            pname=$(plugin_name_of "${plugins[$i]}")
+                            [ -n "$pname" ] || pname="${plugins[$i]}"
+                            [ -d "node_modules/$pname" ] || continue
+                            delete_list+=("$pname")
+                        done
+                    else
+                        for num in $plugin_nums; do
+                            if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt ${#plugins[@]} ]; then
+                                warn "忽略无效的序号：$num"
                                 continue
                             fi
-                            # 依赖已移除，务必确认 bundles 也摘掉了
-                            if remove_from_bundles "$plugin_short_name"; then
-                                success_count=$((success_count + 1))
-                            else
-                                warn "已从依赖移除，但未能更新 dsh.profile.bundles：$plugin_short_name"
-                                echo "  这会导致 DSH 启动报 cannot resolve profile bundle，请手动处理："
-                                echo "  编辑 package.json，把 bundles 里的 \"$plugin_short_name\" 删掉"
-                                fail_count=$((fail_count + 1))
-                            fi
+                            pname=$(plugin_name_of "${plugins[$((num - 1))]}")
+                            [ -n "$pname" ] || pname="${plugins[$((num - 1))]}"
+                            delete_list+=("$pname")
                         done
-                        
-                        echo
-                        echo "批量删除完成："
-                        echo "  成功：$success_count 个"
-                        echo "  失败：$fail_count 个"
-                        
-                        if [ $success_count -gt 0 ]; then
-                            echo "提示：可能需要重启 DSH 服务"
+                    fi
+
+                    # 未安装的包 pnpm 也删不掉，单独列出来跳过
+                    local -a todo=() skipped=()
+                    for pname in "${delete_list[@]}"; do
+                        if [ -d "node_modules/$pname" ]; then
+                            todo+=("$pname")
+                        else
+                            skipped+=("$pname（未安装）")
                         fi
-                    else
+                    done
+                    if [ ${#skipped[@]} -gt 0 ]; then
+                        echo
+                        echo "跳过："
+                        for pname in "${skipped[@]}"; do printf '  %s\n' "$pname"; done
+                    fi
+                    if [ ${#todo[@]} -eq 0 ]; then
+                        warn "没有需要删除的插件"
+                        continue
+                    fi
+
+                    echo
+                    echo "将要删除："
+                    for pname in "${todo[@]}"; do printf '  %s\n' "$pname"; done
+                    read -r -p "确认删除以上 ${#todo[@]} 个插件？(y/N): " CONFIRM || CONFIRM=""
+                    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
                         warn "操作已取消"
+                        continue
+                    fi
+
+                    # 删除会同时改 dependencies 和 bundles，必须两者都成功：
+                    # bundles 改不掉、包却没了，DSH 下次启动就报
+                    # cannot resolve profile bundle。现在用 node 解析，
+                    # DSH 离不开 node，所以不再依赖 jq / python3。
+                    if ! command -v node >/dev/null 2>&1; then
+                        err "缺少 node，无法安全删除插件"
+                        echo "  删除插件必须同步更新 package.json 的 bundles。"
+                        continue
+                    fi
+
+                    local success_count=0
+                    local fail_count=0
+                    for pname in "${todo[@]}"; do
+                        echo "删除插件：$pname"
+                        if ! pnpm remove "$pname" >/dev/null 2>&1; then
+                            warn "删除失败：$pname"
+                            fail_count=$((fail_count + 1))
+                            continue
+                        fi
+                        if remove_from_bundles "$pname"; then
+                            success_count=$((success_count + 1))
+                        else
+                            warn "已从依赖移除，但未能更新 dsh.profile.bundles：$pname"
+                            echo "  这会导致 DSH 启动报 cannot resolve profile bundle，请手动处理："
+                            echo "  编辑 package.json，把 bundles 里的 \"$pname\" 删掉"
+                            fail_count=$((fail_count + 1))
+                        fi
+                    done
+
+                    echo
+                    echo "批量删除完成："
+                    echo "  成功：$success_count 个"
+                    echo "  失败：$fail_count 个"
+                    if [ $success_count -gt 0 ]; then
+                        echo "提示：可能需要重启 DSH 服务"
                     fi
                     ;;
                 5)
